@@ -35,3 +35,10 @@ MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
 # 当前阶段我们先用 mock 数据打通流程，所以默认设为 true
 # 当你以后接入真实搜索 API，再把它改成 false
 USE_MOCK_SEARCH = os.getenv("USE_MOCK_SEARCH", "true").lower() == "true"
+
+# mock search 的测试模式
+# normal：正常返回
+# duplicate：制造重复 URL
+# empty：返回空结果
+# dirty：返回缺字段/脏数据
+MOCK_MODE = os.getenv("MOCK_MODE", "normal")

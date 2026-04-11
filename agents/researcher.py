@@ -287,36 +287,39 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
 def report_node(state: ResearchState) -> Dict[str, Any]:
     """
     report 节点：根据问题、笔记和搜索结果生成最终报告。
-
-    输入：
-    - state["question"]
-    - state["notes"]
-    - state["search_results"]
-
-    输出：
-    - {"final_report": "..."}
-
-    稳定性增强点：
-    1. 对来源按 url 去重
-    2. 控制来源数量，避免报告尾部过长
-    3. 当 notes 为空时仍尽量基于搜索结果生成报告
     """
     question = state["question"]
     notes = state.get("notes", [])
     results = state.get("search_results", [])
 
-    # 把笔记整理成文本
+    # 如果没有任何搜索结果，直接返回一个保守版报告
+    # 不再让模型在“无证据”情况下自由生成大段分析
+    if not results:
+        log_step("Report", "没有搜索结果，返回保守版报告。")
+
+        fallback_report = f"""# 主题概述
+当前未检索到与“{question}”相关的搜索结果，因此暂时无法基于外部资料生成可靠研究报告。
+
+# 关键发现
+1. 当前搜索结果为空，说明本轮检索未提供可用证据。
+2. 现阶段不应输出基于外部来源的结论性分析。
+3. 建议检查搜索工具、搜索 query 或 mock 模式设置。
+
+# 参考来源
+（暂无可用来源）
+"""
+        return {"final_report": fallback_report}
+
+    # ===== 以下保留你原本的正常逻辑 =====
     notes_text = "\n".join([f"- {note}" for note in notes]) if notes else "（暂无研究笔记）"
 
-    # 把搜索结果整理成文本
     results_text = "\n".join(
         [
             f"- {item['title']} | {item['url']} | {item['snippet']}"
             for item in results
         ]
-    ) if results else "（暂无搜索结果）"
+    )
 
-    # 收集唯一来源，减少重复链接
     unique_sources = _collect_unique_sources(results, limit=6)
     sources_text = "\n".join(
         [f"- {item['title']} | {item['url']}" for item in unique_sources]

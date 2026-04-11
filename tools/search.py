@@ -1,95 +1,118 @@
 from typing import List, Dict
-from config import USE_MOCK_SEARCH
+
+from config import USE_MOCK_SEARCH, MOCK_MODE
 from utils.logger import log_step
 
 
-# 预置几组更像真实世界的 mock 数据
-MOCK_SEARCH_DB = {
-    "LangGraph 的核心概念和架构特点": [
-        {
-            "title": "LangGraph Overview",
-            "url": "https://docs.langchain.com/langgraph/overview",
-            "snippet": "LangGraph 是一个面向有状态 agent workflow 的编排框架，强调状态、节点与边。"
-        },
-        {
-            "title": "LangGraph Quickstart",
-            "url": "https://docs.langchain.com/langgraph/quickstart",
-            "snippet": "LangGraph 提供 StateGraph 等核心抽象，用于构建复杂流程。"
-        },
-        {
-            "title": "What is LangGraph",
-            "url": "https://example.com/langgraph-intro",
-            "snippet": "LangGraph 适合长流程、多步骤、带状态的 agent 系统。"
-        },
-    ],
-    "普通函数调用 agent 的工作原理和典型实现": [
-        {
-            "title": "Function Calling Agent Basics",
-            "url": "https://example.com/function-calling-agent",
-            "snippet": "普通函数调用 agent 通常由 LLM 决定是否调用工具，再由程序执行函数并回填结果。"
-        },
-        {
-            "title": "Tool Calling Pattern",
-            "url": "https://example.com/tool-calling-pattern",
-            "snippet": "这类 agent 常采用线性循环：思考、调用工具、接收结果、继续回答。"
-        },
-        {
-            "title": "LangGraph Overview",
-            "url": "https://docs.langchain.com/langgraph/overview",
-            "snippet": "有些函数调用 agent 在复杂任务上会遇到状态管理困难。"
-        },
-    ],
-    "LangGraph 与普通函数调用 agent 在应用场景和性能上的对比": [
-        {
-            "title": "Agent Architecture Comparison",
-            "url": "https://example.com/agent-compare",
-            "snippet": "LangGraph 更适合复杂长流程，普通函数调用 agent 更适合轻量、线性任务。"
-        },
-        {
-            "title": "LangGraph vs Tool Calling",
-            "url": "https://example.com/langgraph-vs-toolcalling",
-            "snippet": "LangGraph 在状态管理和可扩展性方面更强，但实现复杂度也更高。"
-        },
-        {
-            "title": "Tool Calling Pattern",
-            "url": "https://example.com/tool-calling-pattern",
-            "snippet": "普通函数调用 agent 开销更低，但复杂控制流支持较弱。"
-        },
-    ],
-}
-
-
-def _default_mock_results(query: str) -> List[Dict]:
+def _normal_mock(query: str) -> List[Dict]:
     """
-    当 query 没命中预置 mock 数据时，使用兜底假数据。
+    normal 模式：
+    返回看起来较正常的 mock 结果。
+    不同 query 会生成不同 url，适合测试主链的正常运行。
     """
     return [
         {
-            "title": f"{query} - 示例结果 1",
-            "url": f"https://example.com/search/{abs(hash(query)) % 10000}/1",
-            "snippet": f"这是关于“{query}”的示例摘要 1。"
+            "title": f"{query} - 结果 1",
+            "url": f"https://example.com/{abs(hash(query)) % 10000}/1",
+            "snippet": f"{query} 的摘要 1"
         },
         {
-            "title": f"{query} - 示例结果 2",
-            "url": f"https://example.com/search/{abs(hash(query)) % 10000}/2",
-            "snippet": f"这是关于“{query}”的示例摘要 2。"
+            "title": f"{query} - 结果 2",
+            "url": f"https://example.com/{abs(hash(query)) % 10000}/2",
+            "snippet": f"{query} 的摘要 2"
+        },
+    ]
+
+
+def _duplicate_mock(query: str) -> List[Dict]:
+    """
+    duplicate 模式：
+    故意制造跨 query 重复的 url，
+    用来测试 search_node 的“按 url 去重”是否真的生效。
+    """
+    return [
+        {
+            "title": f"{query} - 重复结果 A",
+            "url": "https://example.com/shared/1",
+            "snippet": f"{query} 的共享摘要 A"
+        },
+        {
+            "title": f"{query} - 重复结果 B",
+            "url": "https://example.com/shared/2",
+            "snippet": f"{query} 的共享摘要 B"
+        },
+    ]
+
+
+def _empty_mock(query: str) -> List[Dict]:
+    """
+    empty 模式：
+    直接返回空列表，
+    用来测试 search_node / synthesize_node / report_node
+    在“没有搜索结果”时是否还能稳住。
+    """
+    return []
+
+
+def _dirty_mock(query: str) -> List[Dict]:
+    """
+    dirty 模式：
+    故意返回不完整、脏的搜索结果，
+    用来测试代码对异常数据的健壮性。
+
+    包含：
+    - 缺少 snippet 的结果
+    - title/url 为空的结果
+    - 一条正常结果
+    """
+    return [
+        {
+            "title": f"{query} - 缺摘要结果",
+            "url": f"https://example.com/dirty/{abs(hash(query)) % 10000}/1",
+        },
+        {
+            "title": "",
+            "url": "",
+            "snippet": f"{query} 的脏数据摘要"
+        },
+        {
+            "title": f"{query} - 正常结果",
+            "url": f"https://example.com/dirty/{abs(hash(query)) % 10000}/2",
+            "snippet": f"{query} 的正常摘要"
         },
     ]
 
 
 def _mock_search(query: str, max_results: int = 5) -> List[Dict]:
     """
-    更真实的 mock search：
-    1. 不同 query 返回不同数据
-    2. 某些 url 会跨 query 重复，用来测试去重
-    3. 没命中时用默认假数据兜底
+    根据 MOCK_MODE 切换不同测试场景。
+
+    这样做的好处是：
+    以后你测试不同 node 时，不需要反复改代码，
+    只需要改 .env 里的 MOCK_MODE。
     """
-    results = MOCK_SEARCH_DB.get(query, _default_mock_results(query))
+    if MOCK_MODE == "duplicate":
+        results = _duplicate_mock(query)
+    elif MOCK_MODE == "empty":
+        results = _empty_mock(query)
+    elif MOCK_MODE == "dirty":
+        results = _dirty_mock(query)
+    else:
+        # 默认走 normal
+        results = _normal_mock(query)
+
     return results[:max_results]
 
 
 def search_web(query: str, max_results: int = 5) -> List[Dict]:
-    log_step("SearchTool", f"执行搜索: {query}")
+    """
+    对外暴露的统一搜索工具函数。
+
+    当前阶段：
+    - 如果 USE_MOCK_SEARCH=True，就使用 mock search
+    - 否则以后这里接真实搜索 API
+    """
+    log_step("SearchTool", f"执行搜索: {query} | mock_mode={MOCK_MODE}")
 
     if USE_MOCK_SEARCH:
         return _mock_search(query, max_results=max_results)
