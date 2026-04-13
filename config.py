@@ -32,8 +32,8 @@ MAX_SEARCH_QUERIES = int(os.getenv("MAX_SEARCH_QUERIES", "3"))
 MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
 
 # 是否启用 mock search
-# 当前阶段我们先用 mock 数据打通流程，所以默认设为 true
-# 当你以后接入真实搜索 API，再把它改成 false
+# true  -> 使用 mock
+# false -> 使用真实搜索 API
 USE_MOCK_SEARCH = os.getenv("USE_MOCK_SEARCH", "true").lower() == "true"
 
 # mock search 的测试模式
@@ -42,3 +42,17 @@ USE_MOCK_SEARCH = os.getenv("USE_MOCK_SEARCH", "true").lower() == "true"
 # empty：返回空结果
 # dirty：返回缺字段/脏数据
 MOCK_MODE = os.getenv("MOCK_MODE", "normal")
+
+# =========================
+# 真实搜索 API 配置
+# =========================
+
+# 这里先以 Tavily 作为第一个真实搜索服务
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+
+# 真实搜索接口地址
+TAVILY_SEARCH_URL = os.getenv("TAVILY_SEARCH_URL", "https://api.tavily.com/search")
+
+# 是否在真实搜索时启用高级搜索深度
+# 可选值通常是 "basic" 或 "advanced"
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
