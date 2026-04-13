@@ -12,8 +12,10 @@ from tools.search import search_web
 from utils.logger import log_step
 from config import MAX_SEARCH_QUERIES, MAX_RESULTS_PER_QUERY
 
+from urllib.parse import urlparse
+
 # 创建一个全局 LLM 服务实例
-# 当前阶段这样写足够了：整个程序启动后复用同一个模型客户端
+# 当前阶段这样写足够：整个程序启动后复用同一个模型客户端
 llm = LLMService()
 
 
@@ -69,40 +71,174 @@ def _fallback_notes_from_results(results: List[Dict[str, Any]], limit: int = 5) 
     return notes
 
 
-def _collect_unique_sources(results: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, str]]:
+def _collect_unique_sources(results: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
     """
-    从 search_results 中提取唯一来源，按 url 去重。
+    从 search_results 中提取最终报告引用来源。
 
-    返回格式例如：
-    [
-        {"title": "...", "url": "..."},
-        {"title": "...", "url": "..."}
-    ]
-
-    report_node 会用它来减少重复来源。
+    规则：
+    1. 先按 url 去重
+    2. 优先保留官方/优先域名来源
+    3. 只有优先来源不足时，才用其他来源补足
     """
-    unique_sources = []
+    from config import PREFERRED_DOMAINS, LOW_PRIORITY_DOMAINS
+
+    deduped_sources = []
     seen_urls = set()
 
     for item in results:
         url = item.get("url", "").strip()
-        title = item.get("title", "").strip()
-
-        if not url:
-            continue
-        if url in seen_urls:
+        if not url or url in seen_urls:
             continue
 
         seen_urls.add(url)
-        unique_sources.append({
-            "title": title or "未命名来源",
+
+        deduped_sources.append({
+            "title": item.get("title", "").strip() or "未命名来源",
             "url": url,
+            "domain": item.get("domain", "").strip(),
+            "source_score": item.get("source_score", 0),
         })
 
-        if len(unique_sources) >= limit:
-            break
+    # 先按总体质量排序
+    deduped_sources.sort(
+        key=lambda item: (
+            1 if _domain_matches(item.get("domain", ""), PREFERRED_DOMAINS) else 0,
+            0 if _domain_matches(item.get("domain", ""), LOW_PRIORITY_DOMAINS) else 1,
+            item.get("source_score", 0),
+            len(item.get("title", "")),
+        ),
+        reverse=True,
+    )
 
-    return unique_sources
+    preferred_sources = []
+    other_sources = []
+
+    for item in deduped_sources:
+        domain = item.get("domain", "").strip().lower()
+
+        if _domain_matches(domain, PREFERRED_DOMAINS):
+            preferred_sources.append(item)
+        else:
+            other_sources.append(item)
+
+    # 优先来源先占位
+    selected_sources = preferred_sources[:limit]
+
+    # 不够再补其他来源
+    if len(selected_sources) < limit:
+        remain = limit - len(selected_sources)
+        selected_sources.extend(other_sources[:remain])
+
+    return selected_sources
+
+
+def _extract_domain(url: str) -> str:
+    """
+    从 URL 中提取域名，便于后续做来源质量判断。
+    例如：
+    https://docs.langchain.com/oss/python/langgraph/overview
+    -> docs.langchain.com
+    """
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc.lower().strip()
+    except Exception:
+        return ""
+
+
+def _domain_matches(domain: str, candidates: List[str]) -> bool:
+    """
+    判断某个 domain 是否命中候选列表。
+
+    例如：
+    domain = "docs.langchain.com"
+    candidates = ["langchain.com"]
+    也应该视为命中，因为它是子域名。
+    """
+    for candidate in candidates:
+        candidate = candidate.lower().strip()
+        if not candidate:
+            continue
+        if domain == candidate or domain.endswith("." + candidate):
+            return True
+    return False
+
+
+def _score_search_result(item: Dict[str, Any]) -> int:
+    """
+    给单条搜索结果打一个简单分数。
+    分数越高，说明越优先保留。
+
+    当前策略比较保守：
+    - 官方文档 / GitHub 优先
+    - 常见社区博客保留，但降权
+    - 有标题、有摘要的结果更优先
+    """
+    from config import PREFERRED_DOMAINS, LOW_PRIORITY_DOMAINS
+
+    score = 0
+
+    url = item.get("url", "").strip()
+    title = item.get("title", "").strip()
+    snippet = item.get("snippet", "").strip()
+    domain = _extract_domain(url)
+
+    # 基础质量分
+    if title:
+        score += 10
+    if snippet:
+        score += 10
+    if url:
+        score += 10
+
+    # 官方/优先来源加分
+    if _domain_matches(domain, PREFERRED_DOMAINS):
+        score += 50
+
+    # 低优先级来源降分，但不直接删除
+    if _domain_matches(domain, LOW_PRIORITY_DOMAINS):
+        score -= 15
+
+    return score
+
+
+def _rank_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    对搜索结果按来源质量做排序。
+    不做强过滤，只做“优先级排序”。
+    """
+    enriched_results = []
+
+    for item in results:
+        copied = dict(item)
+        copied["domain"] = _extract_domain(copied.get("url", ""))
+        copied["source_score"] = _score_search_result(copied)
+        enriched_results.append(copied)
+
+    enriched_results.sort(
+        key=lambda x: (
+            x.get("source_score", 0),
+            len(x.get("snippet", "")),
+            len(x.get("title", "")),
+        ),
+        reverse=True,
+    )
+
+    return enriched_results
+
+
+def _contains_chinese(text: str) -> bool:
+    """
+    判断字符串中是否包含中文字符。
+    """
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _contains_english_letters(text: str) -> bool:
+    """
+    判断字符串中是否包含英文字母。
+    """
+    return any(("a" <= ch.lower() <= "z") for ch in text)
 
 
 def plan_node(state: ResearchState) -> Dict[str, Any]:
@@ -153,6 +289,18 @@ def plan_node(state: ResearchState) -> Dict[str, Any]:
     # 限制 query 数量，避免一次搜太多
     queries = queries[:MAX_SEARCH_QUERIES]
 
+    # 统计语言分布，给出提示
+    chinese_count = sum(1 for q in queries if _contains_chinese(q))
+    english_count = sum(1 for q in queries if _contains_english_letters(q))
+
+    log_step("Plan", f"query language stats: chinese={chinese_count}, english={english_count}")
+
+    if english_count == 0:
+        log_step("Plan", "警告：当前 query 全部偏中文，可能不利于检索官方技术资料。")
+
+    if chinese_count == 0:
+        log_step("Plan", "提示：当前 query 全部偏英文，可能会减少中文补充资料。")
+
     # 如果一个都没有，继续兜底
     if not queries:
         queries = [question]
@@ -177,25 +325,27 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
     稳定性增强点：
     1. 按 url 去重
     2. 跳过空 url
-    3. 打印去重后结果数
+    3. 对来源质量做排序
+    4. 控制最终保留结果数
     """
+    from config import MAX_FILTERED_RESULTS
+
     queries = state.get("search_queries", [])
     all_results: List[Dict[str, Any]] = []
     seen_urls = set()
 
     for idx, query in enumerate(queries, start=1):
-        # 调用搜索工具
         results = search_web(query, max_results=MAX_RESULTS_PER_QUERY)
         log_step("Search", f"query_{idx} 返回 {len(results)} 条结果")
 
         for item in results:
             url = item.get("url", "").strip()
 
-            # url 为空就跳过，因为没有链接的结果基本不可用
+            # 没有 url 的结果直接跳过
             if not url:
                 continue
 
-            # 按 url 去重，避免多个 query 返回重复结果
+            # 去重：如果 url 已经存在，就不重复加入
             if url in seen_urls:
                 continue
 
@@ -211,10 +361,25 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
 
     if not all_results:
         log_step("Search", "警告：去重后没有保留任何搜索结果。")
-    else:
-        log_step("Search", f"去重后共保留 {len(all_results)} 条结果")
+        return {"search_results": []}
 
-    return {"search_results": all_results}
+    # 对搜索结果做来源质量排序
+    ranked_results = _rank_search_results(all_results)
+
+    # 截断：避免把太多低质量结果交给后续节点
+    filtered_results = ranked_results[:MAX_FILTERED_RESULTS]
+
+    log_step("Search", f"去重后共保留 {len(all_results)} 条结果")
+    log_step("Search", f"排序后最终保留 {len(filtered_results)} 条结果")
+
+    # 打印前几条来源，便于调试观察
+    for idx, item in enumerate(filtered_results[:5], start=1):
+        log_step(
+            "Search",
+            f"top_{idx}: score={item.get('source_score', 0)} | domain={item.get('domain', '')} | title={item.get('title', '')}"
+        )
+
+    return {"search_results": filtered_results}
 
 
 def synthesize_node(state: ResearchState) -> Dict[str, Any]:
@@ -292,8 +457,6 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
     notes = state.get("notes", [])
     results = state.get("search_results", [])
 
-    # 如果没有任何搜索结果，直接返回一个保守版报告
-    # 不再让模型在“无证据”情况下自由生成大段分析
     if not results:
         log_step("Report", "没有搜索结果，返回保守版报告。")
 
@@ -310,20 +473,32 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
 """
         return {"final_report": fallback_report}
 
-    # ===== 以下保留你原本的正常逻辑 =====
     notes_text = "\n".join([f"- {note}" for note in notes]) if notes else "（暂无研究笔记）"
+
+    # 候选引用来源
+    unique_sources = _collect_unique_sources(results, limit=4)
+
+    # 只保留和候选引用来源对应的搜索结果
+    selected_urls = {item["url"] for item in unique_sources}
+    selected_results = [item for item in results if item.get("url", "") in selected_urls]
+
+    sources_text = "\n".join(
+        [
+            f"- {item['title']} | {item['url']} | domain={item.get('domain', '')} | score={item.get('source_score', 0)}"
+            for item in unique_sources
+        ]
+    ) if unique_sources else "（暂无可用来源）"
 
     results_text = "\n".join(
         [
-            f"- {item['title']} | {item['url']} | {item['snippet']}"
-            for item in results
+            f"- 标题: {item.get('title', '')}\n"
+            f"  链接: {item.get('url', '')}\n"
+            f"  摘要: {item.get('snippet', '')}\n"
+            f"  域名: {item.get('domain', '')}\n"
+            f"  分数: {item.get('source_score', 0)}"
+            for item in selected_results
         ]
-    )
-
-    unique_sources = _collect_unique_sources(results, limit=6)
-    sources_text = "\n".join(
-        [f"- {item['title']} | {item['url']}" for item in unique_sources]
-    ) if unique_sources else "（暂无可用来源）"
+    ) if selected_results else "（暂无搜索结果）"
 
     user_prompt = f"""
 用户问题：
@@ -332,16 +507,29 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
 研究笔记：
 {notes_text}
 
-搜索结果：
+高质量搜索结果：
 {results_text}
 
-可引用来源（已去重）：
+优先引用来源（已筛选）：
 {sources_text}
 
 请生成最终研究报告。
+
+要求：
+1. 参考来源只从“优先引用来源（已筛选）”中选择
+2. 不要编造不存在的来源
+3. 如果某些结论无法从当前来源中支撑，就不要强行下结论
+4. 优先引用官方文档、官方博客、官方参考资料
+5. 参考来源数量控制在 3~5 条
 """.strip()
 
     final_report = llm.chat(REPORT_SYSTEM_PROMPT, user_prompt)
 
-    log_step("Report", "报告生成完成")
+    log_step("Report", f"报告生成完成，候选引用来源数={len(unique_sources)}")
+    for idx, item in enumerate(unique_sources[:5], start=1):
+        log_step(
+            "Report",
+            f"source_{idx}: score={item.get('source_score', 0)} | domain={item.get('domain', '')} | title={item.get('title', '')}"
+        )
+
     return {"final_report": final_report}

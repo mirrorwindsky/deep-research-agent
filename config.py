@@ -56,3 +56,27 @@ TAVILY_SEARCH_URL = os.getenv("TAVILY_SEARCH_URL", "https://api.tavily.com/searc
 # 是否在真实搜索时启用高级搜索深度
 # 可选值通常是 "basic" 或 "advanced"
 TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
+
+# =========================
+# 搜索结果质量控制配置
+# =========================
+
+# search_node 在去重后最多保留多少条结果
+MAX_FILTERED_RESULTS = int(os.getenv("MAX_FILTERED_RESULTS", "8"))
+
+# 优先来源：这些域名会在排序时获得更高分
+PREFERRED_DOMAINS = [
+    "docs.langchain.com",
+    "langchain.com",
+    "github.com",
+    "python.langchain.com",
+]
+
+# 降权来源：这些域名不会直接删除，但会在排序时排后
+LOW_PRIORITY_DOMAINS = [
+    "zhihu.com",
+    "zhuanlan.zhihu.com",
+    "cloud.tencent.com",
+    "cnblogs.com",
+    "csdn.net",
+]
