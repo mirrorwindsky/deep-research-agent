@@ -6,8 +6,8 @@ Research workflow 节点模块。
 模块职责：
 1. 定义 research graph 中的核心节点函数
 2. 负责在节点级别完成状态读取、调用外部能力、回写状态
-3. 保持 workflow 主链清晰：
-   plan -> search -> synthesize -> report
+3. 保持 workflow 主链清晰，并逐步向 deep research v2 升级：
+   plan -> search -> read_pages -> build_evidence_cards -> judge_search_quality -> rewrite_query / synthesize_evidence -> report
 
 设计原则：
 1. 节点层负责流程编排，不承担过多底层策略细节
@@ -222,7 +222,12 @@ def plan_node(state: ResearchState) -> Dict[str, Any]:
     for idx, query in enumerate(queries, start=1):
         log_step("Plan", f"query_{idx}: {query}")
 
-    return {"search_queries": queries}
+    return {
+        "search_queries": queries,
+        "retry_count": 0,
+        "needs_retry": False,
+        "rewritten_queries": [],
+    }
 
 
 def search_node(state: ResearchState) -> Dict[str, Any]:
@@ -247,7 +252,9 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
     """
     from config import MAX_FILTERED_RESULTS
 
-    queries = state.get("search_queries", [])
+    # 若存在补搜后的 rewritten_queries，则优先使用；
+    # 否则使用 planner 生成的 search_queries。
+    queries = state.get("rewritten_queries") or state.get("search_queries", [])
     all_results: List[Dict[str, Any]] = []
     seen_urls = set()
 
@@ -303,6 +310,212 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
         )
 
     return {"search_results": filtered_results}
+
+
+def read_pages_node(state: ResearchState) -> Dict[str, Any]:
+    """
+    read_pages 节点：读取高优先级搜索结果对应的页面内容。
+
+    当前阶段目标：
+    - 先为 v2 graph 提供可编译节点
+    - 暂时不执行真实页面抓取
+    - 先将搜索结果映射为 page_results 的占位结构
+
+    后续将逐步扩展为：
+    1. 读取前若干高分页面正文
+    2. 对页面内容进行摘要
+    3. 为证据卡构建提供页面级输入
+    """
+    search_results = state.get("search_results", [])
+
+    page_results: List[Dict[str, Any]] = []
+    for item in search_results:
+        page_results.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "query": item.get("query", ""),
+            "source_type": item.get("source_type", ""),
+            "page_kind": item.get("page_kind", ""),
+            "source_score": item.get("source_score", 0),
+            # 当前阶段仅做占位。
+            # page_content 后续由真实页面读取逻辑填充。
+            "page_content": item.get("snippet", ""),
+            # 当前阶段先直接复用 snippet 作为页面摘要占位值。
+            "page_summary": item.get("snippet", ""),
+        })
+
+    log_step("ReadPages", f"生成 {len(page_results)} 条 page_results 占位结果")
+    return {"page_results": page_results}
+
+
+def build_evidence_cards_node(state: ResearchState) -> Dict[str, Any]:
+    """
+    build_evidence_cards 节点：将页面结果转换为结构化证据卡。
+
+    当前阶段目标：
+    - 先为 v2 graph 提供可编译节点
+    - 暂时采用极简规则，将 page_summary 映射为 evidence card
+    - 为后续 evidence-based synthesize / report 打基础
+
+    后续将逐步扩展为：
+    1. 从页面摘要中抽取 claim
+    2. 为不同子问题建立证据聚合
+    3. 引入更明确的证据片段与置信度信息
+    """
+    question = state.get("question", "")
+    page_results = state.get("page_results", [])
+
+    evidence_cards: List[Dict[str, Any]] = []
+
+    for item in page_results:
+        summary = item.get("page_summary", "").strip()
+        if not summary:
+            continue
+
+        evidence_cards.append({
+            "sub_question": item.get("query", question),
+            "claim": summary,
+            "evidence": summary,
+            "source_url": item.get("url", ""),
+            "source_title": item.get("title", ""),
+            "source_type": item.get("source_type", ""),
+        })
+
+    log_step("Evidence", f"构建 {len(evidence_cards)} 条 evidence_cards")
+    return {"evidence_cards": evidence_cards}
+
+
+def judge_search_quality_node(state: ResearchState) -> Dict[str, Any]:
+    """
+    judge_search_quality 节点：判断当前搜索与证据质量是否足够进入综合阶段。
+
+    当前阶段采用最小规则版本：
+    - 若 evidence_cards 数量过少，且尚未补搜，则触发一次补搜
+    - 若 evidence_cards 数量足够，或已经补搜过一次，则直接进入综合
+
+    后续将逐步扩展为：
+    1. 统计高质量来源数量
+    2. 判断是否覆盖主要子问题
+    3. 判断是否缺少官方来源或实现类证据
+    """
+    evidence_cards = state.get("evidence_cards", [])
+    retry_count = state.get("retry_count", 0)
+
+    needs_retry = False
+
+    # 第一版规则：
+    # 证据过少且还没补搜过，则允许触发一次补搜。
+    if len(evidence_cards) < 3 and retry_count < 1:
+        needs_retry = True
+
+    log_step(
+        "Judge",
+        f"evidence_cards={len(evidence_cards)} | retry_count={retry_count} | needs_retry={needs_retry}"
+    )
+
+    return {"needs_retry": needs_retry}
+
+
+def rewrite_query_node(state: ResearchState) -> Dict[str, Any]:
+    """
+    rewrite_query 节点：在当前证据不足时生成一轮补搜 query。
+
+    当前阶段采用最小实现：
+    - 若原始 search_queries 存在，则在其基础上附加更偏官方资料的检索意图
+    - 若原始 search_queries 为空，则回退使用 question
+
+    后续将逐步扩展为：
+    1. 基于搜索缺口生成更精确的补搜 query
+    2. 根据证据缺失类型分别补官方文档 / example / comparison query
+    3. 使用模型进行更智能的 query rewrite
+    """
+    question = state.get("question", "")
+    original_queries = state.get("search_queries", [])
+    retry_count = state.get("retry_count", 0)
+
+    base_queries = original_queries or [question]
+
+    rewritten_queries = [
+        f"{query} official documentation"
+        for query in base_queries[:2]
+    ]
+
+    # 保序去重，避免生成重复补搜 query
+    rewritten_queries = _deduplicate_strings(rewritten_queries)
+
+    new_retry_count = retry_count + 1
+
+    log_step("RewriteQuery", f"生成 {len(rewritten_queries)} 条补搜 query")
+    for idx, query in enumerate(rewritten_queries, start=1):
+        log_step("RewriteQuery", f"rewrite_query_{idx}: {query}")
+
+    return {
+        "rewritten_queries": rewritten_queries,
+        "retry_count": new_retry_count,
+    }
+
+
+def synthesize_evidence_node(state: ResearchState) -> Dict[str, Any]:
+    """
+    synthesize_evidence 节点：基于 evidence_cards 生成综合笔记。
+
+    当前阶段采用兼容策略：
+    - 若 evidence_cards 存在，则优先基于 evidence_cards 生成 notes
+    - 若 evidence_cards 为空，则回退复用原有 synthesize_node 逻辑
+
+    设计原因：
+    - 当前阶段优先确保 v2 graph 能跑通
+    - 避免在切换到 evidence-based 主链时破坏旧逻辑
+    """
+    question = state["question"]
+    evidence_cards = state.get("evidence_cards", [])
+
+    if not evidence_cards:
+        log_step("SynthesizeEvidence", "没有 evidence_cards，回退使用原 synthesize_node 逻辑。")
+        return synthesize_node(state)
+
+    material = "\n".join(
+        [
+            (
+                f"- 子问题: {item.get('sub_question', '')}\n"
+                f"  结论: {item.get('claim', '')}\n"
+                f"  证据: {item.get('evidence', '')}\n"
+                f"  来源标题: {item.get('source_title', '')}\n"
+                f"  来源链接: {item.get('source_url', '')}\n"
+                f"  来源类型: {item.get('source_type', '')}"
+            )
+            for item in evidence_cards
+        ]
+    )
+
+    user_prompt = f"""
+研究问题：
+{question}
+
+结构化证据：
+{material}
+
+请基于以上证据生成研究笔记。
+""".strip()
+
+    notes_text = llm.chat(SYNTHESIZER_SYSTEM_PROMPT, user_prompt)
+
+    notes: List[str] = []
+    for line in notes_text.splitlines():
+        cleaned = line.strip().lstrip("-•1234567890. ").strip()
+        if cleaned:
+            notes.append(cleaned)
+
+    notes = _deduplicate_strings(notes)
+
+    if not notes:
+        log_step("SynthesizeEvidence", "模型未生成有效 notes，回退使用证据 claim。")
+        notes = _deduplicate_strings(
+            [item.get("claim", "").strip() for item in evidence_cards if item.get("claim", "").strip()]
+        )
+
+    log_step("SynthesizeEvidence", f"提炼出 {len(notes)} 条笔记")
+    return {"notes": notes}
 
 
 def synthesize_node(state: ResearchState) -> Dict[str, Any]:

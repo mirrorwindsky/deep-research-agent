@@ -4,20 +4,19 @@
 Research workflow 共享状态定义模块。
 
 模块职责：
-1. 定义整个 research workflow 中统一使用的状态结构
+1. 定义整个 deep research workflow 的统一状态结构
 2. 为各节点之间的数据传递提供一致的数据契约
 3. 明确主链各阶段会读写哪些核心字段
 
 设计目标：
-1. 避免节点之间以松散、无约束的方式传递数据
-2. 使 graph 中的状态流转结构清晰可读
-3. 为后续增加新状态字段提供统一入口
+1. 支持从“搜索结果级”流程升级到“页面阅读 + 证据组织 + 质量判断”流程
+2. 保持状态字段命名清晰，便于节点开发与调试
+3. 为后续增加更多中间产物预留扩展空间
 
 说明：
 - 当前状态定义采用 TypedDict
 - total=False 表示字段允许分阶段逐步出现，而非一开始全部具备
-- 该设计与当前线性 workflow 高度契合：
-  question -> search_queries -> search_results -> notes -> final_report
+- 该设计与当前的多阶段 graph 流程相匹配
 """
 
 from typing import Any, Dict, List, TypedDict
@@ -25,54 +24,73 @@ from typing import Any, Dict, List, TypedDict
 
 class ResearchState(TypedDict, total=False):
     """
-    research workflow 的共享状态结构。
+    deep research workflow 的共享状态结构。
 
     字段说明：
     - question:
         用户输入的原始研究问题
     - search_queries:
-        plan 节点生成的搜索子问题列表
+        planner 生成的初始搜索子问题列表
     - search_results:
-        search 节点收集并筛选后的搜索结果
+        search 节点返回的搜索结果列表
+    - page_results:
+        read_pages 节点读取页面后的结果列表
+    - evidence_cards:
+        build_evidence_cards 节点生成的结构化证据卡列表
+    - needs_retry:
+        judge_search_quality 节点输出的补搜标记
+    - retry_count:
+        当前补搜轮次计数
+    - rewritten_queries:
+        rewrite_query 节点生成的补搜 query 列表
     - notes:
-        synthesize 节点提炼出的研究笔记
+        synthesize_evidence 节点生成的综合笔记
     - final_report:
         report 节点生成的最终报告文本
-
-    设计说明：
-    - total=False 允许状态字段分阶段逐步补充
-    - 该特性非常适合 LangGraph 中“节点逐步丰富 state”的使用方式
-    - 当前状态字段数量保持精简，优先支撑第一阶段主链闭环
     """
 
     # 用户输入的原始研究问题。
-    # 整条 workflow 的起点字段。
     question: str
 
-    # plan 节点生成出的搜索子问题列表。
-    # 典型形式：
-    # [
-    #   "LangGraph 的核心设计目标",
-    #   "ordinary function calling agent architecture",
-    #   "LangGraph vs function calling agent differences"
-    # ]
+    # planner 生成的初始搜索子问题列表。
     search_queries: List[str]
 
-    # search 节点收集到的搜索结果。
+    # search 节点返回的搜索结果。
     # 每条结果通常包含：
     # - title
     # - url
     # - snippet
     # - query
-    # 以及经过排序增强后补充的评分相关字段。
+    # 以及来源评分相关字段。
     search_results: List[Dict[str, Any]]
 
-    # synthesize 节点提炼出的研究笔记。
-    # 典型形式：
-    # [
-    #   "LangGraph 更强调显式状态流转与节点编排",
-    #   "普通函数调用 agent 通常结构更轻量，但可控性较弱"
-    # ]
+    # read_pages 节点读取页面后的结果。
+    # 每条结果通常包含：
+    # - 原始搜索结果字段
+    # - page_content
+    # - page_summary
+    page_results: List[Dict[str, Any]]
+
+    # build_evidence_cards 节点生成的结构化证据卡。
+    # 每条证据卡通常包含：
+    # - sub_question
+    # - claim
+    # - evidence
+    # - source_url
+    # - source_title
+    # - source_type
+    evidence_cards: List[Dict[str, Any]]
+
+    # judge_search_quality 节点输出的补搜标记。
+    needs_retry: bool
+
+    # 当前补搜轮次。
+    retry_count: int
+
+    # rewrite_query 节点生成的补搜 query。
+    rewritten_queries: List[str]
+
+    # synthesize_evidence 节点输出的综合笔记。
     notes: List[str]
 
     # report 节点生成的最终报告文本。
