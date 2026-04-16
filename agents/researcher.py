@@ -1,43 +1,81 @@
-import json
-from typing import Dict, Any, List
+# agents/researcher.py
 
-from schemas.state import ResearchState
-from services.llm import LLMService
+"""
+Research workflow 节点模块。
+
+模块职责：
+1. 定义 research graph 中的核心节点函数
+2. 负责在节点级别完成状态读取、调用外部能力、回写状态
+3. 保持 workflow 主链清晰：
+   plan -> search -> synthesize -> report
+
+设计原则：
+1. 节点层负责流程编排，不承担过多底层策略细节
+2. 搜索结果质量控制逻辑下沉到 services/search_ranker.py
+3. 节点函数尽量保持“读 state -> 做一件事 -> 返回局部更新”的结构
+4. 在当前阶段优先保证主链稳定、易调试、易扩展
+
+说明：
+- 当前文件保留少量通用辅助函数，例如字符串去重、兜底 notes 提取、语言特征判断
+- 搜索结果排序、来源识别、候选引用来源收口等逻辑已抽离到独立服务模块
+"""
+
+import json
+from typing import Any, Dict, List
+
+from config import MAX_RESULTS_PER_QUERY, MAX_SEARCH_QUERIES
+from prompts.output_prompts import REPORT_SYSTEM_PROMPT
 from prompts.system_prompts import (
     PLANNER_SYSTEM_PROMPT,
     SYNTHESIZER_SYSTEM_PROMPT,
 )
-from prompts.output_prompts import REPORT_SYSTEM_PROMPT
+from schemas.state import ResearchState
+from services.llm import LLMService
+from services.search_ranker import (
+    collect_unique_sources,
+    rank_search_results,
+)
 from tools.search import search_web
 from utils.logger import log_step
-from config import MAX_SEARCH_QUERIES, MAX_RESULTS_PER_QUERY
 
-from urllib.parse import urlparse
-
-# 创建一个全局 LLM 服务实例
-# 当前阶段这样写足够：整个程序启动后复用同一个模型客户端
+# 创建全局 LLM 服务实例。
+#
+# 设计原因：
+# 1. 避免每次进入节点函数时重复初始化模型客户端
+# 2. 当前项目规模较小，此写法已经足够稳定且直接
+# 3. 若后续需要支持多模型切换、依赖注入或测试替身，再进一步抽象
 llm = LLMService()
 
 
 def _deduplicate_strings(items: List[str]) -> List[str]:
     """
-    对字符串列表做去重，并保持原有顺序。
+    对字符串列表做保序去重。
 
-    例如：
-    ["A", "B", "A", "C"] -> ["A", "B", "C"]
+    输入：
+    - items: 原始字符串列表
 
-    这个工具函数主要给 plan_node 用，
-    防止模型生成重复或高度相似的 query。
+    输出：
+    - 去重后的字符串列表，保持首次出现顺序不变
+
+    典型用途：
+    - 对 planner 输出的 query 做去重
+    - 对 synthesize 阶段的 notes 做去重
+
+    说明：
+    - 当前去重基于字符串标准化后的完全匹配
+    - 暂不处理“语义相近但文本不同”的重复情况
     """
     seen = set()
-    result = []
+    result: List[str] = []
 
     for item in items:
         normalized = item.strip()
         if not normalized:
             continue
+
         if normalized in seen:
             continue
+
         seen.add(normalized)
         result.append(normalized)
 
@@ -46,19 +84,32 @@ def _deduplicate_strings(items: List[str]) -> List[str]:
 
 def _fallback_notes_from_results(results: List[Dict[str, Any]], limit: int = 5) -> List[str]:
     """
-    当 synthesize_node 没有成功从模型那里得到有效 notes 时，
-    使用搜索结果的 snippet 做一个最简单的兜底版本。
+    从搜索结果中提取兜底研究笔记。
 
-    这样做的目的是：
-    即使模型在“提炼笔记”这一步失效，整个 workflow 也不会彻底断掉。
+    设计原因：
+    - synthesize_node 主要依赖模型将搜索结果压缩为研究笔记
+    - 若模型未返回有效内容，整条 workflow 不应直接失效
+    - 因此在模型提炼失败时，使用 snippet 生成最简兜底 notes
+
+    参数：
+    - results: 搜索结果列表
+    - limit: 最多提取多少条兜底笔记
+
+    返回：
+    - 基于 snippet 提取的笔记列表
+
+    说明：
+    - 当前实现只做最基础的 snippet 去重与截断
+    - 后续可扩展为“优先高分来源摘要”或“按来源类型选择摘要”
     """
-    notes = []
+    notes: List[str] = []
     seen = set()
 
     for item in results:
         snippet = item.get("snippet", "").strip()
         if not snippet:
             continue
+
         if snippet in seen:
             continue
 
@@ -71,165 +122,17 @@ def _fallback_notes_from_results(results: List[Dict[str, Any]], limit: int = 5) 
     return notes
 
 
-def _collect_unique_sources(results: List[Dict[str, Any]], limit: int = 6) -> List[Dict[str, Any]]:
-    """
-    从 search_results 中提取最终报告引用来源。
-
-    规则：
-    1. 先按 url 去重
-    2. 优先保留官方/优先域名来源
-    3. 只有优先来源不足时，才用其他来源补足
-    """
-    from config import PREFERRED_DOMAINS, LOW_PRIORITY_DOMAINS
-
-    deduped_sources = []
-    seen_urls = set()
-
-    for item in results:
-        url = item.get("url", "").strip()
-        if not url or url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-
-        deduped_sources.append({
-            "title": item.get("title", "").strip() or "未命名来源",
-            "url": url,
-            "domain": item.get("domain", "").strip(),
-            "source_score": item.get("source_score", 0),
-        })
-
-    # 先按总体质量排序
-    deduped_sources.sort(
-        key=lambda item: (
-            1 if _domain_matches(item.get("domain", ""), PREFERRED_DOMAINS) else 0,
-            0 if _domain_matches(item.get("domain", ""), LOW_PRIORITY_DOMAINS) else 1,
-            item.get("source_score", 0),
-            len(item.get("title", "")),
-        ),
-        reverse=True,
-    )
-
-    preferred_sources = []
-    other_sources = []
-
-    for item in deduped_sources:
-        domain = item.get("domain", "").strip().lower()
-
-        if _domain_matches(domain, PREFERRED_DOMAINS):
-            preferred_sources.append(item)
-        else:
-            other_sources.append(item)
-
-    # 优先来源先占位
-    selected_sources = preferred_sources[:limit]
-
-    # 不够再补其他来源
-    if len(selected_sources) < limit:
-        remain = limit - len(selected_sources)
-        selected_sources.extend(other_sources[:remain])
-
-    return selected_sources
-
-
-def _extract_domain(url: str) -> str:
-    """
-    从 URL 中提取域名，便于后续做来源质量判断。
-    例如：
-    https://docs.langchain.com/oss/python/langgraph/overview
-    -> docs.langchain.com
-    """
-    try:
-        parsed = urlparse(url)
-        return parsed.netloc.lower().strip()
-    except Exception:
-        return ""
-
-
-def _domain_matches(domain: str, candidates: List[str]) -> bool:
-    """
-    判断某个 domain 是否命中候选列表。
-
-    例如：
-    domain = "docs.langchain.com"
-    candidates = ["langchain.com"]
-    也应该视为命中，因为它是子域名。
-    """
-    for candidate in candidates:
-        candidate = candidate.lower().strip()
-        if not candidate:
-            continue
-        if domain == candidate or domain.endswith("." + candidate):
-            return True
-    return False
-
-
-def _score_search_result(item: Dict[str, Any]) -> int:
-    """
-    给单条搜索结果打一个简单分数。
-    分数越高，说明越优先保留。
-
-    当前策略比较保守：
-    - 官方文档 / GitHub 优先
-    - 常见社区博客保留，但降权
-    - 有标题、有摘要的结果更优先
-    """
-    from config import PREFERRED_DOMAINS, LOW_PRIORITY_DOMAINS
-
-    score = 0
-
-    url = item.get("url", "").strip()
-    title = item.get("title", "").strip()
-    snippet = item.get("snippet", "").strip()
-    domain = _extract_domain(url)
-
-    # 基础质量分
-    if title:
-        score += 10
-    if snippet:
-        score += 10
-    if url:
-        score += 10
-
-    # 官方/优先来源加分
-    if _domain_matches(domain, PREFERRED_DOMAINS):
-        score += 50
-
-    # 低优先级来源降分，但不直接删除
-    if _domain_matches(domain, LOW_PRIORITY_DOMAINS):
-        score -= 15
-
-    return score
-
-
-def _rank_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    对搜索结果按来源质量做排序。
-    不做强过滤，只做“优先级排序”。
-    """
-    enriched_results = []
-
-    for item in results:
-        copied = dict(item)
-        copied["domain"] = _extract_domain(copied.get("url", ""))
-        copied["source_score"] = _score_search_result(copied)
-        enriched_results.append(copied)
-
-    enriched_results.sort(
-        key=lambda x: (
-            x.get("source_score", 0),
-            len(x.get("snippet", "")),
-            len(x.get("title", "")),
-        ),
-        reverse=True,
-    )
-
-    return enriched_results
-
-
 def _contains_chinese(text: str) -> bool:
     """
     判断字符串中是否包含中文字符。
+
+    用途：
+    - 辅助观察 planner 输出的 query 语言分布
+    - 作为当前阶段的简单语言特征统计工具
+
+    说明：
+    - 该函数仅判断是否包含中文字符
+    - 不负责识别文本主语言，也不做复杂语言分类
     """
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
@@ -237,13 +140,21 @@ def _contains_chinese(text: str) -> bool:
 def _contains_english_letters(text: str) -> bool:
     """
     判断字符串中是否包含英文字母。
+
+    用途：
+    - 辅助观察 planner 输出的 query 语言分布
+    - 检查 query 是否包含英文技术术语或英文检索意图
+
+    说明：
+    - 该函数仅判断是否存在英文字母
+    - 中英混合 query 可能会同时被中文统计与英文统计命中
     """
     return any(("a" <= ch.lower() <= "z") for ch in text)
 
 
 def plan_node(state: ResearchState) -> Dict[str, Any]:
     """
-    plan 节点：把用户原始问题拆成搜索子问题。
+    plan 节点：将用户原始研究问题拆解为搜索子问题。
 
     输入：
     - state["question"]
@@ -251,45 +162,47 @@ def plan_node(state: ResearchState) -> Dict[str, Any]:
     输出：
     - {"search_queries": [...]}
 
-    稳定性增强点：
-    1. 解析 JSON 失败时兜底
-    2. query 清洗
-    3. query 去重
-    4. 数量限制
+    当前职责：
+    1. 调用 planner prompt 生成结构化 query 列表
+    2. 对模型输出做 JSON 解析
+    3. 清洗、去重并限制 query 数量
+    4. 输出语言分布日志，辅助观察 planner 行为
+
+    稳定性保护：
+    - 模型输出不是合法 JSON 时，回退为原问题
+    - queries 字段不是列表时，回退为原问题
+    - 清洗后无有效 query 时，回退为原问题
     """
     question = state["question"]
 
-    # 给模型的用户输入
+    # planner 的用户输入保持简单明确，避免在节点层叠加额外提示噪音
     user_prompt = f"用户研究问题：{question}"
 
-    # 调用模型，让它返回 JSON 格式的搜索子问题
+    # 调用模型，期望返回 JSON 格式的搜索子问题列表
     raw_output = llm.chat(PLANNER_SYSTEM_PROMPT, user_prompt)
 
     try:
-        # 尝试把模型输出解析成 JSON
         data = json.loads(raw_output)
         queries = data.get("queries", [])
 
-        # 如果 queries 不是列表，就回退
         if not isinstance(queries, list):
-            log_step("Plan", "模型输出中 queries 不是列表，已回退为原问题。")
+            log_step("Plan", "模型输出中的 queries 字段不是列表，已回退为原问题。")
             queries = [question]
 
     except Exception:
-        # 如果模型没有输出合法 JSON，就用原问题兜底
         log_step("Plan", "模型输出不是合法 JSON，已回退为原问题。")
         queries = [question]
 
-    # 只保留非空字符串
+    # 仅保留非空字符串，去除多余空白
     queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
 
-    # 去重，避免重复 query
+    # 保序去重，避免出现完全重复的检索子问题
     queries = _deduplicate_strings(queries)
 
-    # 限制 query 数量，避免一次搜太多
+    # 限制 query 数量，避免单轮搜索过于发散
     queries = queries[:MAX_SEARCH_QUERIES]
 
-    # 统计语言分布，给出提示
+    # 统计语言特征，便于观察 planner 是否按预期生成中英混合 query
     chinese_count = sum(1 for q in queries if _contains_chinese(q))
     english_count = sum(1 for q in queries if _contains_english_letters(q))
 
@@ -301,7 +214,7 @@ def plan_node(state: ResearchState) -> Dict[str, Any]:
     if chinese_count == 0:
         log_step("Plan", "提示：当前 query 全部偏英文，可能会减少中文补充资料。")
 
-    # 如果一个都没有，继续兜底
+    # 清洗后若无有效 query，则继续以原问题兜底
     if not queries:
         queries = [question]
 
@@ -314,7 +227,7 @@ def plan_node(state: ResearchState) -> Dict[str, Any]:
 
 def search_node(state: ResearchState) -> Dict[str, Any]:
     """
-    search 节点：逐个执行搜索子问题，并收集结果。
+    search 节点：根据搜索子问题执行检索，并对结果进行去重、排序和截断。
 
     输入：
     - state["search_queries"]
@@ -322,11 +235,15 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
     输出：
     - {"search_results": [...]}
 
-    稳定性增强点：
-    1. 按 url 去重
-    2. 跳过空 url
-    3. 对来源质量做排序
-    4. 控制最终保留结果数
+    当前职责：
+    1. 逐个 query 调用统一搜索工具接口
+    2. 按 URL 去重，避免重复结果污染后续阶段
+    3. 调用 search_ranker 对结果做来源质量增强与排序
+    4. 截断低优先级结果，减少后续节点处理噪音
+
+    设计说明：
+    - 节点层不再直接承担来源打分细节
+    - 来源识别、页面识别、query_fit 打分、信息密度打分已下沉到 services/search_ranker.py
     """
     from config import MAX_FILTERED_RESULTS
 
@@ -341,16 +258,18 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
         for item in results:
             url = item.get("url", "").strip()
 
-            # 没有 url 的结果直接跳过
+            # 没有 URL 的结果无法作为可靠来源，直接跳过
             if not url:
                 continue
 
-            # 去重：如果 url 已经存在，就不重复加入
+            # URL 去重，避免多个 query 返回完全相同的结果
             if url in seen_urls:
                 continue
 
             seen_urls.add(url)
 
+            # 当前阶段统一保留基础字段。
+            # 评分增强信息在 rank_search_results() 中统一补充。
             result_item = {
                 "title": item.get("title", "").strip(),
                 "url": url,
@@ -363,20 +282,24 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
         log_step("Search", "警告：去重后没有保留任何搜索结果。")
         return {"search_results": []}
 
-    # 对搜索结果做来源质量排序
-    ranked_results = _rank_search_results(all_results)
+    # 对搜索结果做来源质量增强与排序
+    ranked_results = rank_search_results(all_results)
 
-    # 截断：避免把太多低质量结果交给后续节点
+    # 控制最终结果数量，避免低质量或边缘结果进入后续上下文
     filtered_results = ranked_results[:MAX_FILTERED_RESULTS]
 
     log_step("Search", f"去重后共保留 {len(all_results)} 条结果")
     log_step("Search", f"排序后最终保留 {len(filtered_results)} 条结果")
 
-    # 打印前几条来源，便于调试观察
+    # 输出前几条排序结果，便于在 search only 模式下观察策略行为
     for idx, item in enumerate(filtered_results[:5], start=1):
         log_step(
             "Search",
-            f"top_{idx}: score={item.get('source_score', 0)} | domain={item.get('domain', '')} | title={item.get('title', '')}"
+            f"top_{idx}: score={item.get('source_score', 0)} | "
+            f"source_type={item.get('source_type', '')} | "
+            f"page_kind={item.get('page_kind', '')} | "
+            f"domain={item.get('domain', '')} | "
+            f"title={item.get('title', '')}"
         )
 
     return {"search_results": filtered_results}
@@ -384,7 +307,7 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
 
 def synthesize_node(state: ResearchState) -> Dict[str, Any]:
     """
-    synthesize 节点：把搜索结果整理成研究笔记。
+    synthesize 节点：将搜索结果整理为研究笔记。
 
     输入：
     - state["question"]
@@ -393,10 +316,15 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
     输出：
     - {"notes": [...]}
 
-    稳定性增强点：
-    1. 如果搜索结果为空，直接返回空 notes
-    2. 如果模型输出为空，自动使用 snippet 兜底生成 notes
-    3. 对 notes 做简单去重
+    当前职责：
+    1. 将搜索结果组织为供模型阅读的材料
+    2. 调用 synthesize prompt 提炼研究笔记
+    3. 对输出笔记做简单清洗与去重
+    4. 在模型输出失效时，使用搜索摘要做兜底
+
+    设计说明：
+    - synthesize 阶段的目标不是直接产出最终报告
+    - 该阶段承担“中间压缩层”角色，为 report 阶段提供更稳定的结构化输入
     """
     question = state["question"]
     results = state.get("search_results", [])
@@ -405,7 +333,7 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
         log_step("Synthesize", "没有搜索结果可供综合，返回空 notes。")
         return {"notes": []}
 
-    # 把搜索结果拼成一段材料，交给模型阅读
+    # 将搜索结果组织成统一材料块，供模型做摘要与提炼
     material = "\n".join(
         [
             (
@@ -430,17 +358,17 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
 
     notes_text = llm.chat(SYNTHESIZER_SYSTEM_PROMPT, user_prompt)
 
-    # 按行切分，清理可能的列表符号
-    notes = []
+    # 逐行提取笔记，并清理常见列表符号
+    notes: List[str] = []
     for line in notes_text.splitlines():
         cleaned = line.strip().lstrip("-•1234567890. ").strip()
         if cleaned:
             notes.append(cleaned)
 
-    # 对 notes 做简单去重
+    # 保序去重，避免模型输出重复笔记
     notes = _deduplicate_strings(notes)
 
-    # 如果模型没有产出有效 notes，则使用搜索摘要兜底
+    # 若模型未生成有效 notes，则使用 snippet 做兜底
     if not notes:
         log_step("Synthesize", "模型未生成有效 notes，使用 snippet 兜底。")
         notes = _fallback_notes_from_results(results, limit=5)
@@ -451,7 +379,25 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
 
 def report_node(state: ResearchState) -> Dict[str, Any]:
     """
-    report 节点：根据问题、笔记和搜索结果生成最终报告。
+    report 节点：根据问题、研究笔记和搜索结果生成最终研究报告。
+
+    输入：
+    - state["question"]
+    - state["notes"]
+    - state["search_results"]
+
+    输出：
+    - {"final_report": "..."}
+
+    当前职责：
+    1. 在有搜索结果时，组织高质量结果与候选引用来源
+    2. 在无搜索结果时，返回保守版报告
+    3. 控制最终 prompt 中的来源范围，避免模型乱引用或过度发散
+
+    设计说明：
+    - report 阶段不直接消费全部搜索结果
+    - 更合理的做法是先通过 collect_unique_sources() 收口为少量高质量候选来源
+    - 该设计有利于控制引用质量，并减少重复来源占用上下文
     """
     question = state["question"]
     notes = state.get("notes", [])
@@ -475,16 +421,17 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
 
     notes_text = "\n".join([f"- {note}" for note in notes]) if notes else "（暂无研究笔记）"
 
-    # 候选引用来源
-    unique_sources = _collect_unique_sources(results, limit=4)
+    # 从搜索结果中收集去重后的候选引用来源
+    unique_sources = collect_unique_sources(results, limit=4)
 
-    # 只保留和候选引用来源对应的搜索结果
+    # 仅保留候选引用来源对应的详细搜索结果，减少 prompt 噪音
     selected_urls = {item["url"] for item in unique_sources}
     selected_results = [item for item in results if item.get("url", "") in selected_urls]
 
     sources_text = "\n".join(
         [
-            f"- {item['title']} | {item['url']} | domain={item.get('domain', '')} | score={item.get('source_score', 0)}"
+            f"- {item['title']} | {item['url']} | "
+            f"domain={item.get('domain', '')} | score={item.get('source_score', 0)}"
             for item in unique_sources
         ]
     ) if unique_sources else "（暂无可用来源）"
@@ -529,7 +476,8 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
     for idx, item in enumerate(unique_sources[:5], start=1):
         log_step(
             "Report",
-            f"source_{idx}: score={item.get('source_score', 0)} | domain={item.get('domain', '')} | title={item.get('title', '')}"
+            f"source_{idx}: score={item.get('source_score', 0)} | "
+            f"domain={item.get('domain', '')} | title={item.get('title', '')}"
         )
 
     return {"final_report": final_report}
