@@ -192,6 +192,54 @@ def run_read_pages_only():
         save_json("sample_page_results.json", read_result.get("page_results", []))
 
 
+def run_build_evidence_only():
+    """
+    执行 search_node + read_pages_node + build_evidence_cards_node。
+
+    适用场景：
+    - 独立观察 evidence card 构建效果
+    - 验证 page_content / page_summary 是否能产生可用 claim 与 evidence
+    - 避免每次都执行完整 graph 与最终报告生成
+    """
+    question = input("请输入原始研究问题：\n> ").strip()
+
+    print("请输入 query，每行一条，输入空行结束：")
+    queries = []
+
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        queries.append(line)
+
+    if not queries and question:
+        queries = [question]
+
+    state = {
+        "question": question,
+        "search_queries": queries,
+    }
+
+    search_result = search_node(state)
+    state.update(search_result)
+
+    read_result = read_pages_node(state)
+    state.update(read_result)
+
+    evidence_result = build_evidence_cards_node(state)
+
+    print("\n===== EVIDENCE CARDS RESULT =====")
+    print(json.dumps(evidence_result, ensure_ascii=False, indent=2))
+
+    should_save = input("\n是否保存 evidence_cards 到 debug_data？(y/n)\n> ").strip().lower()
+    if should_save == "y":
+        save_json("sample_evidence_cards.json", evidence_result.get("evidence_cards", []))
+
+    should_save_pages = input("\n是否同时保存 page_results 到 debug_data？(y/n)\n> ").strip().lower()
+    if should_save_pages == "y":
+        save_json("sample_page_results.json", read_result.get("page_results", []))
+
+
 def main():
     """
     调试模式选择入口。
@@ -202,6 +250,7 @@ def main():
     print("3. synthesize only")
     print("4. report only")
     print("5. read pages only")
+    print("6. build evidence only")
 
     choice = input("> ").strip()
 
@@ -215,6 +264,8 @@ def main():
         run_report_only()
     elif choice == "5":
         run_read_pages_only()
+    elif choice == "6":
+        run_build_evidence_only()
     else:
         print("无效选择。")
 

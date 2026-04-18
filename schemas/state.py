@@ -39,6 +39,8 @@ class ResearchState(TypedDict, total=False):
         build_evidence_cards 节点生成的结构化证据卡列表
     - needs_retry:
         judge_search_quality 节点输出的补搜标记
+    - evidence_gaps:
+        judge_search_quality 节点识别出的证据缺口
     - retry_count:
         当前补搜轮次计数
     - rewritten_queries:
@@ -83,6 +85,14 @@ class ResearchState(TypedDict, total=False):
 
     # judge_search_quality 节点输出的补搜标记。
     needs_retry: bool
+
+    # judge_search_quality 节点识别出的证据缺口。
+    # 典型取值：
+    # - insufficient_evidence
+    # - official_source_missing
+    # - source_diversity_low
+    # - example_source_missing
+    evidence_gaps: List[str]
 
     # 当前补搜轮次。
     retry_count: int

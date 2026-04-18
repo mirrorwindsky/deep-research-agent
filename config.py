@@ -68,7 +68,7 @@ MAX_SEARCH_QUERIES = int(os.getenv("MAX_SEARCH_QUERIES", "3"))
 #
 # 该值决定 search_node 从搜索工具层接收的结果规模。
 # 最终真正进入后续节点的结果，还会经过去重、排序和截断。
-MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
+MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "6"))
 
 # search_node 在排序完成后，最终最多保留多少条结果进入后续节点。
 #
@@ -76,14 +76,14 @@ MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
 # 1. 减少低质量结果污染 synthesize / report 阶段
 # 2. 控制上下文长度，降低 prompt 噪音
 # 3. 保持当前阶段系统行为稳定且便于观察
-MAX_FILTERED_RESULTS = int(os.getenv("MAX_FILTERED_RESULTS", "8"))
+MAX_FILTERED_RESULTS = int(os.getenv("MAX_FILTERED_RESULTS", "12"))
 
 # read_pages_node 最多读取多少条高分页面。
 #
 # 设计原因：
 # 1. 页面读取和页面摘要都会增加时延与模型成本
 # 2. 第一版 deep research v2 先聚焦前若干高质量来源
-MAX_PAGE_READS = int(os.getenv("MAX_PAGE_READS", "3"))
+MAX_PAGE_READS = int(os.getenv("MAX_PAGE_READS", "5"))
 
 # 单个页面请求的超时时间（秒）。
 #
@@ -99,7 +99,7 @@ PAGE_READ_TIMEOUT = int(os.getenv("PAGE_READ_TIMEOUT", "10"))
 # 设计原因：
 # 1. 控制后续摘要 prompt 的长度
 # 2. 避免把整页噪音内容全部交给模型
-PAGE_CONTENT_MAX_CHARS = int(os.getenv("PAGE_CONTENT_MAX_CHARS", "4000"))
+PAGE_CONTENT_MAX_CHARS = int(os.getenv("PAGE_CONTENT_MAX_CHARS", "5000"))
 
 # =========================
 # Mock Search 配置

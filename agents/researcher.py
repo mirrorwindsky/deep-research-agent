@@ -30,9 +30,15 @@ from prompts.system_prompts import (
     SYNTHESIZER_SYSTEM_PROMPT,
 )
 from schemas.state import ResearchState
+from services.evidence_builder import build_evidence_cards_from_pages
+from services.evidence_judge import judge_evidence_quality
+from services.evidence_synthesizer import (
+    build_evidence_synthesis_prompt,
+    fallback_notes_from_evidence,
+)
 from services.llm import LLMService
+from services.report_builder import build_report_prompt
 from services.search_ranker import (
-    collect_unique_sources,
     rank_search_results,
 )
 from services.page_reader import fetch_page_content
@@ -461,33 +467,23 @@ def build_evidence_cards_node(state: ResearchState) -> Dict[str, Any]:
     build_evidence_cards 节点：将页面结果转换为结构化证据卡。
 
     当前阶段目标：
-    - 先为 v2 graph 提供可编译节点
-    - 暂时采用极简规则，将 page_summary 映射为 evidence card
-    - 为后续 evidence-based synthesize / report 打基础
+    - 从 page_summary/page_content 中提炼句子级 claim
+    - 将 claim 绑定到同页 page_content 中更接近原文的 evidence
+    - 为后续 evidence-based synthesize / report 提供结构化输入
 
-    后续将逐步扩展为：
-    1. 从页面摘要中抽取 claim
-    2. 为不同子问题建立证据聚合
-    3. 引入更明确的证据片段与置信度信息
+    当前实现策略：
+    1. 每个页面最多生成 2 条 evidence card
+    2. 优先从 page_summary 生成 claim，必要时回退到 snippet/page_content
+    3. evidence 优先来自 page_content 中与 claim 关键词重合度最高的句子
+    4. 暂不引入复杂置信度建模或额外模型调用
     """
     question = state.get("question", "")
     page_results = state.get("page_results", [])
 
-    evidence_cards: List[Dict[str, Any]] = []
-
-    for item in page_results:
-        summary = item.get("page_summary", "").strip()
-        if not summary:
-            continue
-
-        evidence_cards.append({
-            "sub_question": item.get("query", question),
-            "claim": summary,
-            "evidence": summary,
-            "source_url": item.get("url", ""),
-            "source_title": item.get("title", ""),
-            "source_type": item.get("source_type", ""),
-        })
+    evidence_cards = build_evidence_cards_from_pages(
+        question=question,
+        page_results=page_results,
+    )
 
     log_step("Evidence", f"构建 {len(evidence_cards)} 条 evidence_cards")
     return {"evidence_cards": evidence_cards}
@@ -497,63 +493,101 @@ def judge_search_quality_node(state: ResearchState) -> Dict[str, Any]:
     """
     judge_search_quality 节点：判断当前搜索与证据质量是否足够进入综合阶段。
 
-    当前阶段采用最小规则版本：
-    - 若 evidence_cards 数量过少，且尚未补搜，则触发一次补搜
-    - 若 evidence_cards 数量足够，或已经补搜过一次，则直接进入综合
+    当前规则：
+    1. evidence_cards 数量过少时标记 insufficient_evidence
+    2. 缺少官方来源时标记 official_source_missing
+    3. 证据过度集中于单一 domain 时标记 source_diversity_low
+    4. 缺少 example/readme 类实现证据时标记 example_source_missing
+    5. 若已经补搜过一次，则不再触发补搜
 
-    后续将逐步扩展为：
-    1. 统计高质量来源数量
-    2. 判断是否覆盖主要子问题
-    3. 判断是否缺少官方来源或实现类证据
+    输出：
+    - needs_retry: 是否进入 rewrite_query 分支
+    - evidence_gaps: 当前识别出的证据缺口，供 rewrite_query_node 使用
     """
     evidence_cards = state.get("evidence_cards", [])
     retry_count = state.get("retry_count", 0)
 
-    needs_retry = False
-
-    # 第一版规则：
-    # 证据过少且还没补搜过，则允许触发一次补搜。
-    if len(evidence_cards) < 3 and retry_count < 1:
-        needs_retry = True
+    quality_result = judge_evidence_quality(
+        evidence_cards=evidence_cards,
+        retry_count=retry_count,
+    )
+    needs_retry = quality_result["needs_retry"]
+    evidence_gaps = quality_result["evidence_gaps"]
+    metrics = quality_result["metrics"]
 
     log_step(
         "Judge",
-        f"evidence_cards={len(evidence_cards)} | retry_count={retry_count} | needs_retry={needs_retry}"
+        f"evidence_cards={metrics['evidence_count']} | "
+        f"official_count={metrics['official_count']} | "
+        f"domains={metrics['domain_count']} | "
+        f"implementation_count={metrics['implementation_count']} | "
+        f"retry_count={metrics['retry_count']} | "
+        f"needs_retry={needs_retry}"
     )
 
-    return {"needs_retry": needs_retry}
+    if evidence_gaps:
+        log_step("Judge", f"evidence_gaps={', '.join(evidence_gaps)}")
+
+    return {
+        "needs_retry": needs_retry,
+        "evidence_gaps": evidence_gaps,
+    }
 
 
 def rewrite_query_node(state: ResearchState) -> Dict[str, Any]:
     """
     rewrite_query 节点：在当前证据不足时生成一轮补搜 query。
 
-    当前阶段采用最小实现：
-    - 若原始 search_queries 存在，则在其基础上附加更偏官方资料的检索意图
-    - 若原始 search_queries 为空，则回退使用 question
+    当前阶段采用基于 evidence_gaps 的规则改写：
+    - official_source_missing: 补官方文档 / 官方参考资料 query
+    - example_source_missing: 补 GitHub example / tutorial query
+    - insufficient_evidence: 补更宽的 docs / guide / reference query
+    - source_diversity_low: 补不同来源形态的 docs / examples query
 
     后续将逐步扩展为：
-    1. 基于搜索缺口生成更精确的补搜 query
-    2. 根据证据缺失类型分别补官方文档 / example / comparison query
+    1. 将 evidence_gaps 与子问题覆盖情况结合
+    2. 根据具体 topic 类型定制补搜模板
     3. 使用模型进行更智能的 query rewrite
     """
     question = state.get("question", "")
     original_queries = state.get("search_queries", [])
     retry_count = state.get("retry_count", 0)
+    evidence_gaps = state.get("evidence_gaps", [])
 
     base_queries = original_queries or [question]
+    primary_query = base_queries[0] if base_queries else question
 
-    rewritten_queries = [
-        f"{query} official documentation"
-        for query in base_queries[:2]
-    ]
+    rewritten_queries: List[str] = []
+
+    if "official_source_missing" in evidence_gaps:
+        rewritten_queries.append(f"{primary_query} official documentation reference")
+
+    if "example_source_missing" in evidence_gaps:
+        rewritten_queries.append(f"{primary_query} GitHub example tutorial")
+
+    if "insufficient_evidence" in evidence_gaps:
+        rewritten_queries.append(f"{primary_query} docs guide implementation")
+
+    if "source_diversity_low" in evidence_gaps:
+        rewritten_queries.append(f"{primary_query} comparison examples best practices")
+
+    # 若 judge 未给出明确缺口，保留一个稳定兜底策略。
+    if not rewritten_queries:
+        rewritten_queries = [
+            f"{query} official documentation"
+            for query in base_queries[:2]
+        ]
 
     # 保序去重，避免生成重复补搜 query
     rewritten_queries = _deduplicate_strings(rewritten_queries)
+    rewritten_queries = rewritten_queries[:MAX_SEARCH_QUERIES]
 
     new_retry_count = retry_count + 1
 
-    log_step("RewriteQuery", f"生成 {len(rewritten_queries)} 条补搜 query")
+    log_step(
+        "RewriteQuery",
+        f"基于 evidence_gaps={evidence_gaps or ['fallback']} 生成 {len(rewritten_queries)} 条补搜 query"
+    )
     for idx, query in enumerate(rewritten_queries, start=1):
         log_step("RewriteQuery", f"rewrite_query_{idx}: {query}")
 
@@ -567,44 +601,28 @@ def synthesize_evidence_node(state: ResearchState) -> Dict[str, Any]:
     """
     synthesize_evidence 节点：基于 evidence_cards 生成综合笔记。
 
-    当前阶段采用兼容策略：
+    当前阶段采用 evidence-first 策略：
     - 若 evidence_cards 存在，则优先基于 evidence_cards 生成 notes
     - 若 evidence_cards 为空，则回退复用原有 synthesize_node 逻辑
+    - 若模型未生成有效 notes，则从 evidence claims 生成兜底 notes
 
     设计原因：
-    - 当前阶段优先确保 v2 graph 能跑通
-    - 避免在切换到 evidence-based 主链时破坏旧逻辑
+    - v2 graph 的综合层应消费结构化证据，而不是直接消费搜索结果
+    - 节点层只负责流程编排，证据材料组织下沉到 services/evidence_synthesizer.py
     """
     question = state["question"]
     evidence_cards = state.get("evidence_cards", [])
+    evidence_gaps = state.get("evidence_gaps", [])
 
     if not evidence_cards:
         log_step("SynthesizeEvidence", "没有 evidence_cards，回退使用原 synthesize_node 逻辑。")
         return synthesize_node(state)
 
-    material = "\n".join(
-        [
-            (
-                f"- 子问题: {item.get('sub_question', '')}\n"
-                f"  结论: {item.get('claim', '')}\n"
-                f"  证据: {item.get('evidence', '')}\n"
-                f"  来源标题: {item.get('source_title', '')}\n"
-                f"  来源链接: {item.get('source_url', '')}\n"
-                f"  来源类型: {item.get('source_type', '')}"
-            )
-            for item in evidence_cards
-        ]
+    user_prompt = build_evidence_synthesis_prompt(
+        question=question,
+        evidence_cards=evidence_cards,
+        evidence_gaps=evidence_gaps,
     )
-
-    user_prompt = f"""
-研究问题：
-{question}
-
-结构化证据：
-{material}
-
-请基于以上证据生成研究笔记。
-""".strip()
 
     notes_text = llm.chat(SYNTHESIZER_SYSTEM_PROMPT, user_prompt)
 
@@ -618,11 +636,12 @@ def synthesize_evidence_node(state: ResearchState) -> Dict[str, Any]:
 
     if not notes:
         log_step("SynthesizeEvidence", "模型未生成有效 notes，回退使用证据 claim。")
-        notes = _deduplicate_strings(
-            [item.get("claim", "").strip() for item in evidence_cards if item.get("claim", "").strip()]
-        )
+        notes = fallback_notes_from_evidence(evidence_cards, limit=8)
 
-    log_step("SynthesizeEvidence", f"提炼出 {len(notes)} 条笔记")
+    log_step(
+        "SynthesizeEvidence",
+        f"基于 {len(evidence_cards)} 条 evidence_cards 提炼出 {len(notes)} 条笔记"
+    )
     return {"notes": notes}
 
 
@@ -700,32 +719,35 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
 
 def report_node(state: ResearchState) -> Dict[str, Any]:
     """
-    report 节点：根据问题、研究笔记和搜索结果生成最终研究报告。
+    report 节点：根据问题、研究笔记、结构化证据和来源生成最终研究报告。
 
     输入：
     - state["question"]
     - state["notes"]
     - state["search_results"]
+    - state["evidence_cards"]
 
     输出：
     - {"final_report": "..."}
 
     当前职责：
-    1. 在有搜索结果时，组织高质量结果与候选引用来源
-    2. 在无搜索结果时，返回保守版报告
+    1. 优先使用 evidence_cards 组织结构化证据与引用来源
+    2. 当 evidence_cards 不存在时，回退使用高质量搜索结果与候选引用来源
+    3. 在无证据、无搜索结果时，返回保守版报告
     3. 控制最终 prompt 中的来源范围，避免模型乱引用或过度发散
 
     设计说明：
-    - report 阶段不直接消费全部搜索结果
-    - 更合理的做法是先通过 collect_unique_sources() 收口为少量高质量候选来源
-    - 该设计有利于控制引用质量，并减少重复来源占用上下文
+    - v2 主链应优先基于 evidence_cards 生成报告
+    - 搜索结果仍作为兼容回退，用于 evidence 不可用的场景
+    - 引用来源优先来自实际支撑 claim 的 evidence cards
     """
     question = state["question"]
     notes = state.get("notes", [])
     results = state.get("search_results", [])
+    evidence_cards = state.get("evidence_cards", [])
 
-    if not results:
-        log_step("Report", "没有搜索结果，返回保守版报告。")
+    if not results and not evidence_cards:
+        log_step("Report", "没有搜索结果或结构化证据，返回保守版报告。")
 
         fallback_report = f"""# 主题概述
 当前未检索到与“{question}”相关的搜索结果，因此暂时无法基于外部资料生成可靠研究报告。
@@ -740,65 +762,34 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
 """
         return {"final_report": fallback_report}
 
-    notes_text = "\n".join([f"- {note}" for note in notes]) if notes else "（暂无研究笔记）"
-
-    # 从搜索结果中收集去重后的候选引用来源
-    unique_sources = collect_unique_sources(results, limit=4)
-
-    # 仅保留候选引用来源对应的详细搜索结果，减少 prompt 噪音
-    selected_urls = {item["url"] for item in unique_sources}
-    selected_results = [item for item in results if item.get("url", "") in selected_urls]
-
-    sources_text = "\n".join(
-        [
-            f"- {item['title']} | {item['url']} | "
-            f"domain={item.get('domain', '')} | score={item.get('source_score', 0)}"
-            for item in unique_sources
-        ]
-    ) if unique_sources else "（暂无可用来源）"
-
-    results_text = "\n".join(
-        [
-            f"- 标题: {item.get('title', '')}\n"
-            f"  链接: {item.get('url', '')}\n"
-            f"  摘要: {item.get('snippet', '')}\n"
-            f"  域名: {item.get('domain', '')}\n"
-            f"  分数: {item.get('source_score', 0)}"
-            for item in selected_results
-        ]
-    ) if selected_results else "（暂无搜索结果）"
-
-    user_prompt = f"""
-用户问题：
-{question}
-
-研究笔记：
-{notes_text}
-
-高质量搜索结果：
-{results_text}
-
-优先引用来源（已筛选）：
-{sources_text}
-
-请生成最终研究报告。
-
-要求：
-1. 参考来源只从“优先引用来源（已筛选）”中选择
-2. 不要编造不存在的来源
-3. 如果某些结论无法从当前来源中支撑，就不要强行下结论
-4. 优先引用官方文档、官方博客、官方参考资料
-5. 参考来源数量控制在 3~5 条
-""".strip()
+    report_material = build_report_prompt(
+        question=question,
+        notes=notes,
+        search_results=results,
+        evidence_cards=evidence_cards,
+    )
+    user_prompt = report_material["prompt"]
+    unique_sources = report_material["unique_sources"]
 
     final_report = llm.chat(REPORT_SYSTEM_PROMPT, user_prompt)
 
-    log_step("Report", f"报告生成完成，候选引用来源数={len(unique_sources)}")
+    log_step(
+        "Report",
+        f"报告生成完成，evidence_cards={len(evidence_cards)} | 候选引用来源数={len(unique_sources)}"
+    )
     for idx, item in enumerate(unique_sources[:5], start=1):
+        score_text = (
+            f"score={item['source_score']} | "
+            if "source_score" in item
+            else ""
+        )
         log_step(
             "Report",
-            f"source_{idx}: score={item.get('source_score', 0)} | "
-            f"domain={item.get('domain', '')} | title={item.get('title', '')}"
+            f"source_{idx}: {score_text}"
+            f"source_type={item.get('source_type', '')} | "
+            f"page_kind={item.get('page_kind', '')} | "
+            f"domain={item.get('domain', '')} | "
+            f"title={item.get('title', '')}"
         )
 
     return {"final_report": final_report}
