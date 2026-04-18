@@ -78,6 +78,29 @@ MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "5"))
 # 3. 保持当前阶段系统行为稳定且便于观察
 MAX_FILTERED_RESULTS = int(os.getenv("MAX_FILTERED_RESULTS", "8"))
 
+# read_pages_node 最多读取多少条高分页面。
+#
+# 设计原因：
+# 1. 页面读取和页面摘要都会增加时延与模型成本
+# 2. 第一版 deep research v2 先聚焦前若干高质量来源
+MAX_PAGE_READS = int(os.getenv("MAX_PAGE_READS", "3"))
+
+# 单个页面请求的超时时间（秒）。
+#
+# 页面读取阶段常见失败原因包括：
+# - 网络慢
+# - 站点响应慢
+# - 站点阻止抓取
+# 当前阶段应尽量快速失败，避免整条链被单个页面拖死。
+PAGE_READ_TIMEOUT = int(os.getenv("PAGE_READ_TIMEOUT", "10"))
+
+# 单页正文最多保留多少字符。
+#
+# 设计原因：
+# 1. 控制后续摘要 prompt 的长度
+# 2. 避免把整页噪音内容全部交给模型
+PAGE_CONTENT_MAX_CHARS = int(os.getenv("PAGE_CONTENT_MAX_CHARS", "4000"))
+
 # =========================
 # Mock Search 配置
 # =========================

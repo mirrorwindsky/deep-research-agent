@@ -23,7 +23,7 @@ Research workflow 节点模块。
 import json
 from typing import Any, Dict, List
 
-from config import MAX_RESULTS_PER_QUERY, MAX_SEARCH_QUERIES
+from config import MAX_PAGE_READS, MAX_RESULTS_PER_QUERY, MAX_SEARCH_QUERIES
 from prompts.output_prompts import REPORT_SYSTEM_PROMPT
 from prompts.system_prompts import (
     PLANNER_SYSTEM_PROMPT,
@@ -35,6 +35,7 @@ from services.search_ranker import (
     collect_unique_sources,
     rank_search_results,
 )
+from services.page_reader import fetch_page_content
 from tools.search import search_web
 from utils.logger import log_step
 
@@ -150,6 +151,64 @@ def _contains_english_letters(text: str) -> bool:
     - 中英混合 query 可能会同时被中文统计与英文统计命中
     """
     return any(("a" <= ch.lower() <= "z") for ch in text)
+
+
+def _summarize_page_content(
+    question: str,
+    query: str,
+    title: str,
+    url: str,
+    page_content: str,
+) -> str:
+    """
+    对页面正文生成简要研究摘要。
+
+    设计目标：
+    1. 将页面正文压缩为更适合 evidence card 构建的摘要
+    2. 保持摘要与当前研究问题和子 query 相关
+    3. 控制摘要长度，避免后续节点处理过于发散
+
+    回退策略：
+    - 若 page_content 为空，则返回空字符串
+    - 若模型调用异常或返回空值，则回退到正文前若干字符
+    """
+    page_content = (page_content or "").strip()
+    if not page_content:
+        return ""
+
+    prompt = f"""
+研究主问题：
+{question}
+
+当前子问题：
+{query}
+
+页面标题：
+{title}
+
+页面链接：
+{url}
+
+页面正文：
+{page_content}
+
+请基于页面正文，生成 3~5 句简明研究摘要。
+要求：
+1. 只保留与研究问题相关的信息
+2. 尽量提取定义、关键机制、区别、实现要点、限制条件等内容
+3. 不要输出项目符号
+4. 不要编造页面中不存在的信息
+""".strip()
+
+    try:
+        summary = llm.chat(SYNTHESIZER_SYSTEM_PROMPT, prompt).strip()
+        if summary:
+            return summary
+    except Exception:
+        pass
+
+    # 模型摘要失败时，回退到正文前若干字符
+    return page_content[:500].strip()
 
 
 def plan_node(state: ResearchState) -> Dict[str, Any]:
@@ -316,35 +375,84 @@ def read_pages_node(state: ResearchState) -> Dict[str, Any]:
     """
     read_pages 节点：读取高优先级搜索结果对应的页面内容。
 
-    当前阶段目标：
-    - 先为 v2 graph 提供可编译节点
-    - 暂时不执行真实页面抓取
-    - 先将搜索结果映射为 page_results 的占位结构
+    当前职责：
+    1. 读取前若干条高分搜索结果对应的页面正文
+    2. 对正文做页面级摘要
+    3. 为 evidence card 构建提供页面级输入
 
-    后续将逐步扩展为：
-    1. 读取前若干高分页面正文
-    2. 对页面内容进行摘要
-    3. 为证据卡构建提供页面级输入
+    当前实现策略：
+    - 仅处理前 MAX_PAGE_READS 条高分结果
+    - 页面请求失败时，回退使用原始 snippet
+    - 页面摘要失败时，回退使用正文片段
     """
+    question = state.get("question", "")
     search_results = state.get("search_results", [])
 
+    if not search_results:
+        log_step("ReadPages", "没有 search_results，返回空 page_results。")
+        return {"page_results": []}
+
+    selected_results = search_results[:MAX_PAGE_READS]
     page_results: List[Dict[str, Any]] = []
-    for item in search_results:
-        page_results.append({
-            "title": item.get("title", ""),
-            "url": item.get("url", ""),
-            "query": item.get("query", ""),
+
+    for idx, item in enumerate(selected_results, start=1):
+        title = item.get("title", "")
+        url = item.get("url", "")
+        query = item.get("query", "")
+        snippet = item.get("snippet", "")
+
+        read_result = fetch_page_content(url)
+
+        read_success = read_result.get("read_success", False)
+        page_content = read_result.get("page_content", "").strip()
+
+        # 若页面正文抓取失败，则回退使用 snippet 作为最小可用内容
+        if not page_content:
+            page_content = snippet.strip()
+
+        page_summary = _summarize_page_content(
+            question=question,
+            query=query,
+            title=title,
+            url=url,
+            page_content=page_content,
+        )
+
+        page_item = {
+            "title": title,
+            "url": url,
+            "query": query,
+            "snippet": snippet,
+            "domain": item.get("domain", ""),
             "source_type": item.get("source_type", ""),
             "page_kind": item.get("page_kind", ""),
             "source_score": item.get("source_score", 0),
-            # 当前阶段仅做占位。
-            # page_content 后续由真实页面读取逻辑填充。
-            "page_content": item.get("snippet", ""),
-            # 当前阶段先直接复用 snippet 作为页面摘要占位值。
-            "page_summary": item.get("snippet", ""),
-        })
+            "source_type_score": item.get("source_type_score", 0),
+            "page_kind_score": item.get("page_kind_score", 0),
+            "query_fit_score": item.get("query_fit_score", 0),
+            "evidence_score": item.get("evidence_score", 0),
+            "reasons": item.get("reasons", []),
+            "read_success": read_success,
+            "read_error": read_result.get("read_error", ""),
+            "final_url": read_result.get("final_url", url),
+            "status_code": read_result.get("status_code"),
+            "content_type": read_result.get("content_type", ""),
+            "page_content": page_content,
+            "page_summary": page_summary,
+        }
+        page_results.append(page_item)
 
-    log_step("ReadPages", f"生成 {len(page_results)} 条 page_results 占位结果")
+        log_step(
+            "ReadPages",
+            f"page_{idx}: read_success={read_success} | "
+            f"domain={page_item.get('domain', '')} | "
+            f"title={title}"
+        )
+
+        if not read_success and read_result.get("read_error"):
+            log_step("ReadPages", f"page_{idx} fallback: {read_result['read_error']}")
+
+    log_step("ReadPages", f"完成页面读取，共生成 {len(page_results)} 条 page_results")
     return {"page_results": page_results}
 
 

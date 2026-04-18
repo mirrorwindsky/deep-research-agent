@@ -21,6 +21,11 @@ from agents.researcher import (
     report_node,
     search_node,
     synthesize_node,
+    read_pages_node,
+    build_evidence_cards_node,
+    judge_search_quality_node,
+    rewrite_query_node,
+    synthesize_evidence_node,
 )
 
 # 调试数据目录。
@@ -159,6 +164,34 @@ def run_report_only():
     print(result.get("final_report", ""))
 
 
+def run_read_pages_only():
+    """
+    执行 search_node + read_pages_node，用于验证真实页面读取能力。
+    """
+    print("请输入 query，每行一条，输入空行结束：")
+    queries = []
+
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        queries.append(line)
+
+    state = {"search_queries": queries}
+
+    search_result = search_node(state)
+    state.update(search_result)
+
+    read_result = read_pages_node(state)
+
+    print("\n===== READ PAGES RESULT =====")
+    print(json.dumps(read_result, ensure_ascii=False, indent=2))
+
+    should_save = input("\n是否保存 page_results 到 debug_data？(y/n)\n> ").strip().lower()
+    if should_save == "y":
+        save_json("sample_page_results.json", read_result.get("page_results", []))
+
+
 def main():
     """
     调试模式选择入口。
@@ -168,6 +201,7 @@ def main():
     print("2. search only")
     print("3. synthesize only")
     print("4. report only")
+    print("5. read pages only")
 
     choice = input("> ").strip()
 
@@ -179,6 +213,8 @@ def main():
         run_synthesize_only()
     elif choice == "4":
         run_report_only()
+    elif choice == "5":
+        run_read_pages_only()
     else:
         print("无效选择。")
 

@@ -208,3 +208,6 @@ __marimo__/
 
 #我的忽略
 example_structure.txt
+AGENT_CONTEXT.md
+TASKS_NEXT.md
+AGENTS.md
