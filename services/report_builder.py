@@ -37,6 +37,20 @@ def _format_read_status(item: Dict[str, Any]) -> str:
     return "失败（使用兜底内容）"
 
 
+def _format_evidence_source(item: Dict[str, Any]) -> str:
+    """
+    格式化 evidence 来源层级，供报告材料显式区分正文证据与 fallback 证据。
+    """
+    evidence_source = item.get("evidence_source", "")
+    if evidence_source:
+        return evidence_source
+
+    if item.get("read_success", False):
+        return "page_content"
+
+    return "snippet_fallback"
+
+
 def collect_unique_evidence_sources(
     evidence_cards: List[Dict[str, Any]],
     limit: int = 5,
@@ -66,6 +80,7 @@ def collect_unique_evidence_sources(
             "read_success": card.get("read_success", False),
             "read_error": card.get("read_error", ""),
             "status_code": card.get("status_code"),
+            "evidence_source": card.get("evidence_source", ""),
         })
 
         if len(sources) >= limit:
@@ -91,6 +106,7 @@ def format_evidence_cards_for_prompt(evidence_cards: List[Dict[str, Any]]) -> st
                 f"  来源链接: {item.get('source_url', '')}\n"
                 f"  来源类型: {item.get('source_type', '')}\n"
                 f"  页面类型: {item.get('page_kind', '')}\n"
+                f"  evidence_source: {_format_evidence_source(item)}\n"
                 f"  页面读取: {_format_read_status(item)}"
             )
             for item in evidence_cards
@@ -144,6 +160,7 @@ def build_report_prompt(
             f"domain={item.get('domain', '')} | "
             f"source_type={item.get('source_type', '')} | "
             f"page_kind={item.get('page_kind', '')} | "
+            f"evidence_source={_format_evidence_source(item)} | "
             f"read_status={_format_read_status(item)}"
             for item in unique_sources
         ]

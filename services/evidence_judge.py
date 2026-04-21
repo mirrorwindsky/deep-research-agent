@@ -17,6 +17,9 @@ from typing import Any, Dict, List
 from services.search_ranker import extract_domain
 
 
+FALLBACK_EVIDENCE_RATIO_THRESHOLD = 0.5
+
+
 def _collect_evidence_domains(evidence_cards: List[Dict[str, Any]]) -> List[str]:
     """
     从 evidence cards 中收集来源域名。
@@ -83,6 +86,16 @@ def judge_evidence_quality(
         for card in evidence_cards
         if card.get("page_kind", "") in implementation_page_kinds
     )
+    fallback_count = sum(
+        1
+        for card in evidence_cards
+        if card.get("evidence_source", "") == "snippet_fallback"
+    )
+    fallback_ratio = (
+        fallback_count / len(evidence_cards)
+        if evidence_cards
+        else 0
+    )
     domains = _collect_evidence_domains(evidence_cards)
     unique_domains = set(domains)
 
@@ -100,6 +113,12 @@ def judge_evidence_quality(
     if implementation_count < 1:
         evidence_gaps.append("example_source_missing")
 
+    if (
+        len(evidence_cards) >= 3
+        and fallback_ratio >= FALLBACK_EVIDENCE_RATIO_THRESHOLD
+    ):
+        evidence_gaps.append("fallback_evidence_too_many")
+
     needs_retry = bool(evidence_gaps) and retry_count < 1
 
     return {
@@ -110,6 +129,8 @@ def judge_evidence_quality(
             "official_count": official_count,
             "domain_count": len(unique_domains),
             "implementation_count": implementation_count,
+            "fallback_count": fallback_count,
+            "fallback_ratio": fallback_ratio,
             "retry_count": retry_count,
         },
     }

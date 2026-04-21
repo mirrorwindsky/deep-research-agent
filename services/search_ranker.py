@@ -371,6 +371,7 @@ def classify_page_kind(url: str, title: str, snippet: str) -> str:
     - docs_page
     - example_page
     - readme
+    - comparison_page
     - tutorial_page
     - issue_or_discussion
     - release_note
@@ -413,6 +414,10 @@ def classify_page_kind(url: str, title: str, snippet: str) -> str:
         if "/api/" in url_l or "/reference/" in url_l or "api reference" in title_l:
             return "api_reference"
         return "docs_page"
+
+    # 对比类页面用于回答方案差异、选型取舍和适用场景，不应归入 release_note。
+    if contains_any(full_text, COMPARISON_HINTS):
+        return "comparison_page"
 
     # release / changelog 页面主要提供版本与功能演进信息
     if contains_any(full_text, OFFICIAL_BLOG_HINTS):

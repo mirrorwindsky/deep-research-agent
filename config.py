@@ -189,6 +189,7 @@ PAGE_KIND_SCORES = {
     "docs_page": 2,
     "example_page": 2,
     "readme": 2,
+    "comparison_page": 1,
     "tutorial_page": 1,
     "issue_or_discussion": 0,
     "release_note": 1,
@@ -343,10 +344,13 @@ COMPARISON_HINTS = [
     "vs",
     "versus",
     "difference",
+    "differences",
     "compare",
     "comparison",
+    "compared",
     "区别",
     "对比",
+    "差异",
 ]
 
 # 实现 / 教程型问题提示词。

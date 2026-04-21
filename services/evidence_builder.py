@@ -251,6 +251,26 @@ def _find_best_evidence_sentence(claim: str, page_content: str, fallback: str) -
     return _shorten_text(best_sentence)
 
 
+def _classify_evidence_source(page_content: str) -> str:
+    """
+    标记 evidence 的来源层级。
+
+    返回值：
+    - page_content: evidence 来自真实页面正文。
+    - snippet_fallback: 页面正文不可用，evidence 来自 page_summary、snippet 或 claim fallback。
+    """
+    content_sentences = [
+        sentence
+        for sentence in _split_research_sentences(page_content)
+        if _is_useful_evidence_sentence(sentence)
+    ]
+
+    if content_sentences:
+        return "page_content"
+
+    return "snippet_fallback"
+
+
 def _build_cards_for_page(
     item: Dict[str, Any],
     question: str,
@@ -323,11 +343,13 @@ def _build_cards_for_page(
             page_content=page_content,
             fallback=summary or snippet,
         )
+        evidence_source = _classify_evidence_source(page_content)
 
         cards.append({
             "sub_question": item.get("query", question),
             "claim": claim,
             "evidence": evidence,
+            "evidence_source": evidence_source,
             "source_url": item.get("final_url") or item.get("url", ""),
             "source_title": item.get("title", ""),
             "source_type": item.get("source_type", ""),

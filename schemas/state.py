@@ -78,6 +78,7 @@ class ResearchState(TypedDict, total=False):
     # - sub_question
     # - claim
     # - evidence
+    # - evidence_source
     # - source_url
     # - source_title
     # - source_type

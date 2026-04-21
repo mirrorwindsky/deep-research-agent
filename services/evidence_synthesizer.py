@@ -60,6 +60,7 @@ def format_grouped_evidence_for_prompt(
                     (
                         f"   来源类型：{card.get('source_type', '')} | "
                         f"页面类型：{card.get('page_kind', '')} | "
+                        f"evidence_source：{card.get('evidence_source', '')} | "
                         f"域名：{card.get('domain', '')}"
                     ),
                 ])

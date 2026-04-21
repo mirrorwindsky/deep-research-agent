@@ -571,6 +571,9 @@ def rewrite_query_node(state: ResearchState) -> Dict[str, Any]:
     if "source_diversity_low" in evidence_gaps:
         rewritten_queries.append(f"{primary_query} comparison examples best practices")
 
+    if "fallback_evidence_too_many" in evidence_gaps:
+        rewritten_queries.append(f"{primary_query} official docs guide reference")
+
     # 若 judge 未给出明确缺口，保留一个稳定兜底策略。
     if not rewritten_queries:
         rewritten_queries = [
