@@ -1,12 +1,11 @@
 name: tests
 
 on:
-  push:
   pull_request:
 
 jobs:
   unit-tests:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
