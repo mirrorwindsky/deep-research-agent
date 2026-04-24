@@ -38,9 +38,9 @@ load_dotenv()
 
 # 使用的模型名称。
 #
-# 当前默认值为 "deepseek-chat"。
+# 当前默认值为 "deepseek-v4-flash"。
 # 若 .env 中显式设置 MODEL_NAME，则以环境变量为准。
-MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-chat")
+MODEL_NAME = os.getenv("MODEL_NAME", "deepseek-v4-flash")
 
 # API Key。
 #
