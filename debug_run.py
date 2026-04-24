@@ -27,6 +27,7 @@ from agents.researcher import (
     synthesize_evidence_node,
     synthesize_node,
 )
+from services.workflow_runner import run_full_v2_workflow
 
 # 调试数据目录。
 # 用于保存 search_results、page_results、evidence_cards、notes、report 等中间样本。
@@ -260,50 +261,11 @@ def run_build_evidence_only():
         save_json("sample_page_results.json", read_result.get("page_results", []))
 
 
-def _record_debug_step(state, step_name: str, result):
+def _print_step_start(step_name: str):
     """
-    记录 full v2 debug 中单个节点的简要输出。
-
-    完整 state 会在运行结束时保存。debug_trace 只保留节点名、输出字段和关键数量，
-    用于快速复盘 agent 决策路径，避免在终端输出大段页面正文。
-    """
-    trace = state.setdefault("debug_trace", [])
-    summary = {
-        "step": step_name,
-        "keys": sorted(result.keys()),
-    }
-
-    if "search_queries" in result:
-        summary["search_query_count"] = len(result.get("search_queries", []))
-    if "search_results" in result:
-        summary["search_result_count"] = len(result.get("search_results", []))
-    if "page_results" in result:
-        summary["page_result_count"] = len(result.get("page_results", []))
-    if "evidence_cards" in result:
-        summary["evidence_card_count"] = len(result.get("evidence_cards", []))
-    if "evidence_gaps" in result:
-        summary["evidence_gaps"] = result.get("evidence_gaps", [])
-    if "needs_retry" in result:
-        summary["needs_retry"] = result.get("needs_retry", False)
-    if "rewritten_queries" in result:
-        summary["rewritten_query_count"] = len(result.get("rewritten_queries", []))
-    if "notes" in result:
-        summary["note_count"] = len(result.get("notes", []))
-    if "final_report" in result:
-        summary["final_report_length"] = len(result.get("final_report", ""))
-
-    trace.append(summary)
-
-
-def _run_debug_node(state, step_name: str, node_func):
-    """
-    执行单个 workflow 节点，将输出合并回 state，并记录 debug_trace。
+    打印 full v2 debug 当前正在执行的节点。
     """
     print(f"\n===== RUNNING {step_name.upper()} =====")
-    result = node_func(state)
-    state.update(result)
-    _record_debug_step(state, step_name, result)
-    return result
 
 
 def run_full_v2_debug():
@@ -325,40 +287,33 @@ def run_full_v2_debug():
         print("研究问题不能为空。")
         return
 
-    state = {
-        "question": question,
-        "debug_trace": [],
-    }
+    result = run_full_v2_workflow(
+        question=question,
+        artifact_dir=DEBUG_DATA_DIR,
+        save_artifacts=True,
+        on_step_start=_print_step_start,
+    )
+    summary = result["summary"]
 
-    _run_debug_node(state, "plan", plan_node)
-    _run_debug_node(state, "search", search_node)
-    _run_debug_node(state, "read_pages", read_pages_node)
-    _run_debug_node(state, "build_evidence_cards", build_evidence_cards_node)
-    _run_debug_node(state, "judge_search_quality", judge_search_quality_node)
-
-    if state.get("needs_retry", False):
-        _run_debug_node(state, "rewrite_query", rewrite_query_node)
-        _run_debug_node(state, "retry_search", search_node)
-        _run_debug_node(state, "retry_read_pages", read_pages_node)
-        _run_debug_node(state, "retry_build_evidence_cards", build_evidence_cards_node)
-        _run_debug_node(state, "retry_judge_search_quality", judge_search_quality_node)
-
-    _run_debug_node(state, "synthesize_evidence", synthesize_evidence_node)
-    _run_debug_node(state, "report", report_node)
-
-    save_json("latest_run_state.json", state)
-    save_json("latest_evidence_cards.json", state.get("evidence_cards", []))
-    save_text("latest_report.md", state.get("final_report", ""))
+    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_run_state.json'}")
+    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_evidence_cards.json'}")
+    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_report.md'}")
+    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_run_summary.json'}")
 
     print("\n===== FULL V2 DEBUG SUMMARY =====")
-    print(f"search_queries: {len(state.get('search_queries', []))}")
-    print(f"search_results: {len(state.get('search_results', []))}")
-    print(f"page_results: {len(state.get('page_results', []))}")
-    print(f"evidence_cards: {len(state.get('evidence_cards', []))}")
-    print(f"needs_retry: {state.get('needs_retry', False)}")
-    print(f"retry_count: {state.get('retry_count', 0)}")
-    print(f"notes: {len(state.get('notes', []))}")
-    print(f"final_report_length: {len(state.get('final_report', ''))}")
+    print(f"run_id: {summary['run_id']}")
+    print(f"status: {summary['status']}")
+    print(f"search_queries: {summary['search_queries']}")
+    print(f"search_results: {summary['search_results']}")
+    print(f"page_results: {summary['page_results']}")
+    print(f"page_read_success_count: {summary['page_read_success_count']}")
+    print(f"page_read_fallback_count: {summary['page_read_fallback_count']}")
+    print(f"evidence_cards: {summary['evidence_cards']}")
+    print(f"needs_retry: {summary['needs_retry']}")
+    print(f"retry_count: {summary['retry_count']}")
+    print(f"notes: {summary['notes']}")
+    print(f"final_report_length: {summary['final_report_length']}")
+    print(f"report_validation_valid: {summary['report_validation_valid']}")
 
 
 def main():

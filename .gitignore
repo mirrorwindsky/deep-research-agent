@@ -212,3 +212,4 @@ AGENT_CONTEXT.md
 TASKS_NEXT.md
 AGENTS.md
 debug_data/latest_*
+debug_data/runs/

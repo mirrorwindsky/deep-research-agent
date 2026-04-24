@@ -5,15 +5,15 @@
 
 职责：
 1. 读取用户输入的研究问题
-2. 构建并执行 research graph
+2. 通过 runtime 执行完整 research workflow
 3. 输出最终研究报告
 
 说明：
 - 该文件只保留入口职责
-- 模型调用、节点逻辑、搜索实现、graph 编排均已拆分到独立模块
+- 模型调用、节点逻辑、搜索实现、workflow 编排均已拆分到独立模块
 """
 
-from graphs.research_graph import build_research_graph
+from services.workflow_runner import run_full_v2_workflow
 
 
 def main():
@@ -23,8 +23,8 @@ def main():
     流程：
     1. 获取研究问题
     2. 校验输入是否为空
-    3. 构建 graph
-    4. 执行 graph
+    3. 通过 runtime 执行 full v2 workflow
+    4. 保存标准运行产物
     5. 输出最终报告
     """
     question = input("请输入你的研究问题：\n> ").strip()
@@ -34,13 +34,20 @@ def main():
         print("研究问题不能为空。")
         return
 
-    app = build_research_graph()
-
-    # 传入初始状态，只包含原始问题
-    result = app.invoke({"question": question})
+    result = run_full_v2_workflow(
+        question=question,
+        save_artifacts=True,
+    )
+    state = result["state"]
+    summary = result["summary"]
 
     print("\n========== 最终研究报告 ==========\n")
-    print(result.get("final_report", "未生成报告"))
+    print(state.get("final_report", "未生成报告"))
+
+    print("\n========== 运行摘要 ==========\n")
+    print(f"run_id: {summary['run_id']}")
+    print(f"status: {summary['status']}")
+    print(f"report_validation_valid: {summary['report_validation_valid']}")
 
 
 if __name__ == "__main__":
