@@ -1,3 +1,13 @@
+"""
+Evidence judge 策略测试。
+
+这些测试保护 evidence card 构建后的补搜判断规则：
+- 证据不足时应触发一轮补搜
+- retry_count 应阻止重复补搜循环
+- 官方、多域名、实现导向证据充分时应通过质量判断
+- 过多 snippet fallback 证据应被视为可靠性不足
+"""
+
 import unittest
 
 from services.evidence_judge import judge_evidence_quality
@@ -11,6 +21,9 @@ def make_card(
     page_kind: str = "docs_page",
     evidence_source: str = "page_content",
 ):
+    """
+    构造 judge 策略测试所需的最小 evidence card。
+    """
     return {
         "claim": "sample claim",
         "evidence": "sample evidence",

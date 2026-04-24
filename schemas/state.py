@@ -49,6 +49,8 @@ class ResearchState(TypedDict, total=False):
         synthesize_evidence 节点生成的综合笔记
     - final_report:
         report 节点生成的最终报告文本
+    - report_validation:
+        report 节点生成的引用编号校验结果
     """
 
     # 用户输入的原始研究问题。
@@ -106,3 +108,6 @@ class ResearchState(TypedDict, total=False):
 
     # report 节点生成的最终报告文本。
     final_report: str
+
+    # report 节点生成的引用编号校验结果。
+    report_validation: Dict[str, Any]

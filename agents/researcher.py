@@ -37,7 +37,8 @@ from services.evidence_synthesizer import (
     fallback_notes_from_evidence,
 )
 from services.llm import LLMService
-from services.report_builder import build_report_prompt
+from services.report_builder import build_report_prompt, ensure_referenced_sources_are_listed
+from services.report_validator import validate_report_citations
 from services.search_ranker import (
     rank_search_results,
 )
@@ -775,6 +776,14 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
     unique_sources = report_material["unique_sources"]
 
     final_report = llm.chat(REPORT_SYSTEM_PROMPT, user_prompt)
+    final_report = ensure_referenced_sources_are_listed(
+        report=final_report,
+        unique_sources=unique_sources,
+    )
+    report_validation = validate_report_citations(
+        report=final_report,
+        unique_sources=unique_sources,
+    )
 
     log_step(
         "Report",
@@ -795,4 +804,16 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
             f"title={item.get('title', '')}"
         )
 
-    return {"final_report": final_report}
+    if not report_validation.get("valid", False):
+        log_step(
+            "Report",
+            "引用校验未完全通过: "
+            f"invalid_citation_ids={report_validation.get('invalid_citation_ids', [])} | "
+            f"invalid_reference_ids={report_validation.get('invalid_reference_ids', [])} | "
+            f"missing_reference_ids={report_validation.get('missing_reference_ids', [])}"
+        )
+
+    return {
+        "final_report": final_report,
+        "report_validation": report_validation,
+    }
