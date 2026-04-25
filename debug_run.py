@@ -27,6 +27,7 @@ from agents.researcher import (
     synthesize_evidence_node,
     synthesize_node,
 )
+from services.cli_view import CliRuntimeView, configure_utf8_console
 from services.workflow_runner import run_full_v2_workflow
 
 # 调试数据目录。
@@ -261,13 +262,6 @@ def run_build_evidence_only():
         save_json("sample_page_results.json", read_result.get("page_results", []))
 
 
-def _print_step_start(step_name: str):
-    """
-    打印 full v2 debug 当前正在执行的节点。
-    """
-    print(f"\n===== RUNNING {step_name.upper()} =====")
-
-
 def run_full_v2_debug():
     """
     执行完整 Deep Research Agent v2 本地调试链路。
@@ -287,39 +281,39 @@ def run_full_v2_debug():
         print("研究问题不能为空。")
         return
 
+    view = CliRuntimeView()
+    view.print_header(question)
+
     result = run_full_v2_workflow(
         question=question,
         artifact_dir=DEBUG_DATA_DIR,
         save_artifacts=True,
-        on_step_start=_print_step_start,
+        on_step_start=view.on_step_start,
+        on_step_complete=view.on_step_complete,
+        on_report_stream=view.on_report_stream,
+        suppress_node_logs=True,
     )
+    state = result["state"]
     summary = result["summary"]
 
-    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_run_state.json'}")
-    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_evidence_cards.json'}")
-    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_report.md'}")
-    print(f"已保存到: {DEBUG_DATA_DIR / 'latest_run_summary.json'}")
+    if view.report_stream_started:
+        view.print_report_stream_end()
 
-    print("\n===== FULL V2 DEBUG SUMMARY =====")
-    print(f"run_id: {summary['run_id']}")
-    print(f"status: {summary['status']}")
-    print(f"search_queries: {summary['search_queries']}")
-    print(f"search_results: {summary['search_results']}")
-    print(f"page_results: {summary['page_results']}")
-    print(f"page_read_success_count: {summary['page_read_success_count']}")
-    print(f"page_read_fallback_count: {summary['page_read_fallback_count']}")
-    print(f"evidence_cards: {summary['evidence_cards']}")
-    print(f"needs_retry: {summary['needs_retry']}")
-    print(f"retry_count: {summary['retry_count']}")
-    print(f"notes: {summary['notes']}")
-    print(f"final_report_length: {summary['final_report_length']}")
-    print(f"report_validation_valid: {summary['report_validation_valid']}")
+    view.print_run_result(
+        summary=summary,
+        report=state.get("final_report", ""),
+        include_artifacts=True,
+        include_report=not view.report_stream_started,
+        include_steps=not view.report_stream_started,
+    )
 
 
 def main():
     """
     调试模式选择入口。
     """
+    configure_utf8_console()
+
     print("选择调试模式：")
     print("1. plan only")
     print("2. search only")

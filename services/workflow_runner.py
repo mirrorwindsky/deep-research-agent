@@ -19,6 +19,8 @@ Research workflow 运行编排模块。
 
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from contextlib import nullcontext, redirect_stdout
+import io
 
 from agents.researcher import (
     build_evidence_cards_node,
@@ -34,6 +36,8 @@ from services.runtime import ResearchRuntime
 
 
 StepCallback = Optional[Callable[[str], None]]
+StepCompleteCallback = Optional[Callable[[Dict[str, Any]], None]]
+ReportStreamCallback = Optional[Callable[[str], None]]
 
 
 def _run_step(
@@ -42,6 +46,8 @@ def _run_step(
     step_name: str,
     node_func,
     on_step_start: StepCallback = None,
+    on_step_complete: StepCompleteCallback = None,
+    suppress_node_logs: bool = False,
 ) -> None:
     """
     执行一个节点，并在需要时通知调用方当前 step 名称。
@@ -53,7 +59,12 @@ def _run_step(
     if on_step_start:
         on_step_start(step_name)
 
-    runtime.run_step(state, step_name, node_func)
+    output_context = redirect_stdout(io.StringIO()) if suppress_node_logs else nullcontext()
+    with output_context:
+        runtime.run_step(state, step_name, node_func)
+
+    if on_step_complete and state.get("debug_trace"):
+        on_step_complete(state["debug_trace"][-1])
 
 
 def run_full_v2_workflow(
@@ -62,6 +73,9 @@ def run_full_v2_workflow(
     artifact_dir: str | Path = "debug_data",
     save_artifacts: bool = True,
     on_step_start: StepCallback = None,
+    on_step_complete: StepCompleteCallback = None,
+    on_report_stream: ReportStreamCallback = None,
+    suppress_node_logs: bool = False,
 ) -> Dict[str, Any]:
     """
     执行完整 Deep Research Agent v2 workflow。
@@ -76,6 +90,9 @@ def run_full_v2_workflow(
     - artifact_dir: 运行产物保存目录
     - save_artifacts: 是否保存 latest_* artifacts
     - on_step_start: 可选 step 开始回调，用于 debug 入口打印进度
+    - on_step_complete: 可选 step 完成回调，用于 CLI 展示节点结果摘要
+    - on_report_stream: 可选最终报告流式输出回调，仅传递给 report 节点
+    - suppress_node_logs: 是否压制节点内部详细日志，仅保留回调层展示
 
     输出：
     - state: 完整 workflow state
@@ -85,21 +102,30 @@ def run_full_v2_workflow(
     runtime = ResearchRuntime(question=question, artifact_dir=artifact_dir)
     state = runtime.initial_state()
 
-    _run_step(runtime, state, "plan", plan_node, on_step_start)
-    _run_step(runtime, state, "search", search_node, on_step_start)
-    _run_step(runtime, state, "read_pages", read_pages_node, on_step_start)
-    _run_step(runtime, state, "build_evidence_cards", build_evidence_cards_node, on_step_start)
-    _run_step(runtime, state, "judge_search_quality", judge_search_quality_node, on_step_start)
+    _run_step(runtime, state, "plan", plan_node, on_step_start, on_step_complete, suppress_node_logs)
+    _run_step(runtime, state, "search", search_node, on_step_start, on_step_complete, suppress_node_logs)
+    _run_step(runtime, state, "read_pages", read_pages_node, on_step_start, on_step_complete, suppress_node_logs)
+    _run_step(runtime, state, "build_evidence_cards", build_evidence_cards_node, on_step_start, on_step_complete, suppress_node_logs)
+    _run_step(runtime, state, "judge_search_quality", judge_search_quality_node, on_step_start, on_step_complete, suppress_node_logs)
 
     if state.get("needs_retry", False):
-        _run_step(runtime, state, "rewrite_query", rewrite_query_node, on_step_start)
-        _run_step(runtime, state, "retry_search", search_node, on_step_start)
-        _run_step(runtime, state, "retry_read_pages", read_pages_node, on_step_start)
-        _run_step(runtime, state, "retry_build_evidence_cards", build_evidence_cards_node, on_step_start)
-        _run_step(runtime, state, "retry_judge_search_quality", judge_search_quality_node, on_step_start)
+        _run_step(runtime, state, "rewrite_query", rewrite_query_node, on_step_start, on_step_complete, suppress_node_logs)
+        _run_step(runtime, state, "retry_search", search_node, on_step_start, on_step_complete, suppress_node_logs)
+        _run_step(runtime, state, "retry_read_pages", read_pages_node, on_step_start, on_step_complete, suppress_node_logs)
+        _run_step(runtime, state, "retry_build_evidence_cards", build_evidence_cards_node, on_step_start, on_step_complete, suppress_node_logs)
+        _run_step(runtime, state, "retry_judge_search_quality", judge_search_quality_node, on_step_start, on_step_complete, suppress_node_logs)
 
-    _run_step(runtime, state, "synthesize_evidence", synthesize_evidence_node, on_step_start)
-    _run_step(runtime, state, "report", report_node, on_step_start)
+    _run_step(runtime, state, "synthesize_evidence", synthesize_evidence_node, on_step_start, on_step_complete, suppress_node_logs)
+
+    def _report_node(current_state: Dict[str, Any]) -> Dict[str, Any]:
+        if not on_report_stream:
+            return report_node(current_state)
+
+        report_state = dict(current_state)
+        report_state["_report_stream_callback"] = on_report_stream
+        return report_node(report_state)
+
+    _run_step(runtime, state, "report", _report_node, on_step_start, on_step_complete, False)
 
     if save_artifacts:
         summary = runtime.save_artifacts(state)

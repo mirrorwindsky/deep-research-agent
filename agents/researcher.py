@@ -775,43 +775,64 @@ def report_node(state: ResearchState) -> Dict[str, Any]:
     user_prompt = report_material["prompt"]
     unique_sources = report_material["unique_sources"]
 
-    final_report = llm.chat(REPORT_SYSTEM_PROMPT, user_prompt)
+    report_stream_callback = state.get("_report_stream_callback")
+
+    if callable(report_stream_callback):
+        report_chunks: List[str] = []
+        for chunk in llm.chat_stream(REPORT_SYSTEM_PROMPT, user_prompt):
+            report_chunks.append(chunk)
+            report_stream_callback(chunk)
+        raw_report = "".join(report_chunks).strip()
+    else:
+        raw_report = llm.chat(REPORT_SYSTEM_PROMPT, user_prompt)
+
     final_report = ensure_referenced_sources_are_listed(
-        report=final_report,
+        report=raw_report,
         unique_sources=unique_sources,
     )
+
+    if callable(report_stream_callback) and final_report != raw_report:
+        if final_report.startswith(raw_report):
+            report_stream_callback(final_report[len(raw_report):])
+        else:
+            report_stream_callback("\n\n[引用补齐后报告已写入 artifacts]\n")
+
+    if callable(report_stream_callback):
+        report_stream_callback("\n")
+
     report_validation = validate_report_citations(
         report=final_report,
         unique_sources=unique_sources,
     )
 
-    log_step(
-        "Report",
-        f"报告生成完成，evidence_cards={len(evidence_cards)} | 候选引用来源数={len(unique_sources)}"
-    )
-    for idx, item in enumerate(unique_sources[:5], start=1):
-        score_text = (
-            f"score={item['source_score']} | "
-            if "source_score" in item
-            else ""
-        )
+    if not callable(report_stream_callback):
         log_step(
             "Report",
-            f"source_{idx}: {score_text}"
-            f"source_type={item.get('source_type', '')} | "
-            f"page_kind={item.get('page_kind', '')} | "
-            f"domain={item.get('domain', '')} | "
-            f"title={item.get('title', '')}"
+            f"报告生成完成，evidence_cards={len(evidence_cards)} | 候选引用来源数={len(unique_sources)}"
         )
+        for idx, item in enumerate(unique_sources[:5], start=1):
+            score_text = (
+                f"score={item['source_score']} | "
+                if "source_score" in item
+                else ""
+            )
+            log_step(
+                "Report",
+                f"source_{idx}: {score_text}"
+                f"source_type={item.get('source_type', '')} | "
+                f"page_kind={item.get('page_kind', '')} | "
+                f"domain={item.get('domain', '')} | "
+                f"title={item.get('title', '')}"
+            )
 
-    if not report_validation.get("valid", False):
-        log_step(
-            "Report",
-            "引用校验未完全通过: "
-            f"invalid_citation_ids={report_validation.get('invalid_citation_ids', [])} | "
-            f"invalid_reference_ids={report_validation.get('invalid_reference_ids', [])} | "
-            f"missing_reference_ids={report_validation.get('missing_reference_ids', [])}"
-        )
+        if not report_validation.get("valid", False):
+            log_step(
+                "Report",
+                "引用校验未完全通过: "
+                f"invalid_citation_ids={report_validation.get('invalid_citation_ids', [])} | "
+                f"invalid_reference_ids={report_validation.get('invalid_reference_ids', [])} | "
+                f"missing_reference_ids={report_validation.get('missing_reference_ids', [])}"
+            )
 
     return {
         "final_report": final_report,

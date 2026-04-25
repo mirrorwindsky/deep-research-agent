@@ -8,6 +8,8 @@ Workflow runner 回归测试。
 """
 
 import unittest
+import io
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from services.workflow_runner import run_full_v2_workflow
@@ -86,6 +88,84 @@ class WorkflowRunnerTests(unittest.TestCase):
         self.assertIn("build_evidence_cards", state["test_steps"])
         self.assertEqual(state["retry_count"], 1)
         self.assertTrue(result["summary"]["report_validation_valid"])
+
+    def test_full_v2_workflow_passes_report_stream_callback_only_to_report_node(self):
+        streamed = []
+
+        def report_with_stream_callback(state):
+            callback = state.get("_report_stream_callback")
+            self.assertTrue(callable(callback))
+            callback("streamed report")
+            return {
+                "final_report": "streamed report",
+                "report_validation": {"valid": True},
+            }
+
+        with (
+            patch("services.workflow_runner.plan_node", _make_node("plan", {"search_queries": ["q"]})),
+            patch("services.workflow_runner.search_node", _make_node("search", {"search_results": [{}]})),
+            patch("services.workflow_runner.read_pages_node", _make_node("read_pages", {"page_results": []})),
+            patch("services.workflow_runner.build_evidence_cards_node", _make_node("build_evidence_cards", {"evidence_cards": []})),
+            patch("services.workflow_runner.judge_search_quality_node", _make_node("judge_search_quality", {"needs_retry": False})),
+            patch("services.workflow_runner.synthesize_evidence_node", _make_node("synthesize_evidence", {"notes": []})),
+            patch("services.workflow_runner.report_node", report_with_stream_callback),
+        ):
+            result = run_full_v2_workflow(
+                question="测试问题",
+                save_artifacts=False,
+                on_report_stream=streamed.append,
+            )
+
+        self.assertEqual(streamed, ["streamed report"])
+        self.assertNotIn("_report_stream_callback", result["state"])
+        self.assertEqual(result["state"]["final_report"], "streamed report")
+
+    def test_full_v2_workflow_step_complete_callback_receives_trace(self):
+        completed_steps = []
+
+        with (
+            patch("services.workflow_runner.plan_node", _make_node("plan", {"search_queries": ["q"]})),
+            patch("services.workflow_runner.search_node", _make_node("search", {"search_results": [{}]})),
+            patch("services.workflow_runner.read_pages_node", _make_node("read_pages", {"page_results": []})),
+            patch("services.workflow_runner.build_evidence_cards_node", _make_node("build_evidence_cards", {"evidence_cards": []})),
+            patch("services.workflow_runner.judge_search_quality_node", _make_node("judge_search_quality", {"needs_retry": False})),
+            patch("services.workflow_runner.synthesize_evidence_node", _make_node("synthesize_evidence", {"notes": []})),
+            patch("services.workflow_runner.report_node", _make_node("report", {"final_report": "report", "report_validation": {"valid": True}})),
+        ):
+            run_full_v2_workflow(
+                question="测试问题",
+                save_artifacts=False,
+                on_step_complete=completed_steps.append,
+            )
+
+        self.assertEqual(completed_steps[0]["step"], "plan")
+        self.assertEqual(completed_steps[-1]["step"], "report")
+        self.assertEqual(completed_steps[-1]["status"], "completed")
+
+    def test_full_v2_workflow_can_suppress_node_logs(self):
+        def noisy_plan(_state):
+            print("hidden node log")
+            return {"search_queries": ["q"]}
+
+        with (
+            patch("services.workflow_runner.plan_node", noisy_plan),
+            patch("services.workflow_runner.search_node", _make_node("search", {"search_results": [{}]})),
+            patch("services.workflow_runner.read_pages_node", _make_node("read_pages", {"page_results": []})),
+            patch("services.workflow_runner.build_evidence_cards_node", _make_node("build_evidence_cards", {"evidence_cards": []})),
+            patch("services.workflow_runner.judge_search_quality_node", _make_node("judge_search_quality", {"needs_retry": False})),
+            patch("services.workflow_runner.synthesize_evidence_node", _make_node("synthesize_evidence", {"notes": []})),
+            patch("services.workflow_runner.report_node", _make_node("report", {"final_report": "report", "report_validation": {"valid": True}})),
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = run_full_v2_workflow(
+                    question="测试问题",
+                    save_artifacts=False,
+                    suppress_node_logs=True,
+                )
+
+        self.assertEqual(result["summary"]["status"], "completed")
+        self.assertNotIn("hidden node log", output.getvalue())
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@
 - 若后续切换模型服务商，只需集中修改本模块
 """
 
+from typing import Iterator
+
 from openai import OpenAI
 
 from config import API_KEY, BASE_URL, MODEL_NAME
@@ -30,6 +32,7 @@ class LLMService:
 
     当前提供的核心能力：
     - chat(system_prompt, user_prompt) -> str
+    - chat_stream(system_prompt, user_prompt) -> Iterator[str]
 
     设计说明：
     - 节点层只依赖该类的高层接口
@@ -95,3 +98,38 @@ class LLMService:
 
         content = response.choices[0].message.content
         return content.strip() if content else ""
+
+    def chat_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """
+        调用一次流式聊天接口。
+
+        参数：
+        - system_prompt:
+            系统提示词，用于定义模型角色、输出规则与行为边界。
+        - user_prompt:
+            当前任务输入，通常由节点函数动态组织。
+
+        返回：
+        - 逐段产出的文本 iterator。
+
+        设计说明：
+        - 该接口主要服务 CLI 最终报告流式展示。
+        - 调用方仍应自行累积完整文本，供后续引用修复、校验和 artifact 保存使用。
+        """
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
