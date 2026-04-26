@@ -156,6 +156,134 @@ class EvidenceJudgeTests(unittest.TestCase):
         self.assertFalse(result["needs_retry"])
         self.assertIn("fallback_evidence_too_many", result["evidence_gaps"])
 
+    def test_implementation_question_without_detail_reports_specific_gap(self):
+        cards = [
+            make_card(
+                url="https://kubernetes.io/docs/operator",
+                domain="kubernetes.io",
+                source_type="official_docs",
+                page_kind="docs_page",
+            ),
+            make_card(
+                url="https://example.com/concepts",
+                domain="example.com",
+                source_type="community_article",
+                page_kind="docs_page",
+            ),
+            make_card(
+                url="https://cncf.io/operator",
+                domain="cncf.io",
+                source_type="official_blog",
+                page_kind="docs_page",
+            ),
+        ]
+
+        result = judge_evidence_quality(
+            evidence_cards=cards,
+            retry_count=0,
+            question="如何实现 Kubernetes Operator？",
+        )
+
+        self.assertTrue(result["needs_retry"])
+        self.assertIn("implementation_detail_missing", result["evidence_gaps"])
+        self.assertTrue(result["metrics"]["needs_implementation_detail"])
+        self.assertFalse(result["metrics"]["has_implementation_evidence"])
+
+    def test_implementation_evidence_satisfies_implementation_question(self):
+        cards = [
+            make_card(
+                url="https://kubernetes.io/docs/operator",
+                domain="kubernetes.io",
+                source_type="official_docs",
+                page_kind="docs_page",
+            ),
+            make_card(
+                url="https://github.com/example/operator",
+                domain="github.com",
+                source_type="official_repo",
+                page_kind="readme",
+            ),
+            make_card(
+                url="https://dev.to/operator",
+                domain="dev.to",
+                source_type="community_article",
+                page_kind="tutorial_page",
+            ),
+        ]
+
+        result = judge_evidence_quality(
+            evidence_cards=cards,
+            retry_count=0,
+            question="如何实现 Kubernetes Operator？",
+        )
+
+        self.assertNotIn("implementation_detail_missing", result["evidence_gaps"])
+        self.assertTrue(result["metrics"]["has_implementation_evidence"])
+
+    def test_comparison_question_without_comparison_material_reports_gap(self):
+        cards = [
+            make_card(
+                url="https://kubernetes.io/docs/operator",
+                domain="kubernetes.io",
+                source_type="official_docs",
+                page_kind="docs_page",
+            ),
+            make_card(
+                url="https://github.com/example/operator",
+                domain="github.com",
+                source_type="official_repo",
+                page_kind="example_page",
+            ),
+            make_card(
+                url="https://dev.to/operator",
+                domain="dev.to",
+                source_type="community_article",
+                page_kind="tutorial_page",
+            ),
+        ]
+
+        result = judge_evidence_quality(
+            evidence_cards=cards,
+            retry_count=0,
+            question="Kubernetes Operator 和 Helm chart 的区别是什么？",
+        )
+
+        self.assertTrue(result["needs_retry"])
+        self.assertIn("comparison_missing", result["evidence_gaps"])
+        self.assertTrue(result["metrics"]["needs_comparison"])
+        self.assertFalse(result["metrics"]["has_comparison_evidence"])
+
+    def test_comparison_evidence_satisfies_comparison_question(self):
+        cards = [
+            make_card(
+                url="https://kubernetes.io/docs/operator",
+                domain="kubernetes.io",
+                source_type="official_docs",
+                page_kind="docs_page",
+            ),
+            make_card(
+                url="https://example.com/operator-vs-helm",
+                domain="example.com",
+                source_type="community_article",
+                page_kind="comparison_page",
+            ),
+            make_card(
+                url="https://github.com/example/operator",
+                domain="github.com",
+                source_type="official_repo",
+                page_kind="example_page",
+            ),
+        ]
+
+        result = judge_evidence_quality(
+            evidence_cards=cards,
+            retry_count=0,
+            question="Kubernetes Operator vs Helm chart 如何选择？",
+        )
+
+        self.assertNotIn("comparison_missing", result["evidence_gaps"])
+        self.assertTrue(result["metrics"]["has_comparison_evidence"])
+
 
 if __name__ == "__main__":
     unittest.main()

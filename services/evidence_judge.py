@@ -20,6 +20,84 @@ from services.search_ranker import extract_domain
 FALLBACK_EVIDENCE_RATIO_THRESHOLD = 0.5
 
 
+IMPLEMENTATION_INTENT_KEYWORDS = {
+    "实现",
+    "如何",
+    "怎么",
+    "步骤",
+    "代码",
+    "配置",
+    "部署",
+    "implement",
+    "implementation",
+    "how to",
+    "step by step",
+    "tutorial",
+    "code",
+    "configure",
+    "deploy",
+}
+
+IMPLEMENTATION_EVIDENCE_KEYWORDS = {
+    "crd",
+    "customresourcedefinition",
+    "controller",
+    "reconcile",
+    "reconciler",
+    "operator sdk",
+    "kubebuilder",
+    "install",
+    "deploy",
+    "yaml",
+    "manifest",
+    "api",
+    "代码",
+    "配置",
+    "部署",
+    "控制器",
+    "自定义资源",
+}
+
+COMPARISON_INTENT_KEYWORDS = {
+    "对比",
+    "区别",
+    "差异",
+    "比较",
+    "选型",
+    "vs",
+    "versus",
+    "compare",
+    "comparison",
+    "difference",
+    "differences",
+    "tradeoff",
+    "trade-off",
+    "alternative",
+    "alternatives",
+}
+
+COMPARISON_EVIDENCE_KEYWORDS = {
+    "对比",
+    "区别",
+    "差异",
+    "比较",
+    "优缺点",
+    "取舍",
+    "vs",
+    "versus",
+    "compare",
+    "comparison",
+    "difference",
+    "differences",
+    "tradeoff",
+    "trade-off",
+    "alternative",
+    "alternatives",
+    "pros",
+    "cons",
+}
+
+
 def _collect_evidence_domains(evidence_cards: List[Dict[str, Any]]) -> List[str]:
     """
     从 evidence cards 中收集来源域名。
@@ -41,9 +119,81 @@ def _collect_evidence_domains(evidence_cards: List[Dict[str, Any]]) -> List[str]
     return domains
 
 
+def _text_contains_any(text: str, keywords: set[str]) -> bool:
+    """
+    判断文本中是否出现任一关键词。
+    """
+    normalized = (text or "").lower()
+    return any(keyword.lower() in normalized for keyword in keywords)
+
+
+def _card_search_text(card: Dict[str, Any]) -> str:
+    """
+    汇总 evidence card 中适合规则判断的文本字段。
+    """
+    return " ".join(
+        [
+            str(card.get("sub_question", "")),
+            str(card.get("claim", "")),
+            str(card.get("evidence", "")),
+            str(card.get("source_title", "")),
+            str(card.get("page_kind", "")),
+            str(card.get("source_type", "")),
+        ]
+    )
+
+
+def _question_needs_implementation_detail(question: str) -> bool:
+    """
+    判断问题是否明显需要实现细节。
+    """
+    return _text_contains_any(question, IMPLEMENTATION_INTENT_KEYWORDS)
+
+
+def _question_needs_comparison(question: str) -> bool:
+    """
+    判断问题是否明显需要对比材料。
+    """
+    return _text_contains_any(question, COMPARISON_INTENT_KEYWORDS)
+
+
+def _has_implementation_evidence(evidence_cards: List[Dict[str, Any]]) -> bool:
+    """
+    判断当前证据是否已经包含实现细节。
+    """
+    implementation_page_kinds = {
+        "example_page",
+        "readme",
+        "tutorial_page",
+        "api_reference",
+    }
+
+    for card in evidence_cards:
+        if card.get("page_kind", "") in implementation_page_kinds:
+            return True
+        if _text_contains_any(_card_search_text(card), IMPLEMENTATION_EVIDENCE_KEYWORDS):
+            return True
+
+    return False
+
+
+def _has_comparison_evidence(evidence_cards: List[Dict[str, Any]]) -> bool:
+    """
+    判断当前证据是否已经包含对比材料。
+    """
+    for card in evidence_cards:
+        if card.get("page_kind", "") == "comparison_page":
+            return True
+        if _text_contains_any(_card_search_text(card), COMPARISON_EVIDENCE_KEYWORDS):
+            return True
+
+    return False
+
+
 def judge_evidence_quality(
     evidence_cards: List[Dict[str, Any]],
     retry_count: int,
+    question: str = "",
 ) -> Dict[str, Any]:
     """
     判断当前 evidence cards 是否足够进入综合阶段。
@@ -51,6 +201,7 @@ def judge_evidence_quality(
     输入：
     - evidence_cards: build_evidence_cards_node 生成的结构化证据
     - retry_count: 当前补搜轮次
+    - question: 原始研究问题，用于判断是否需要实现或对比材料
 
     输出：
     - needs_retry: 是否需要进入补搜分支
@@ -69,13 +220,6 @@ def judge_evidence_quality(
         "official_repo",
         "official_blog",
     }
-    implementation_page_kinds = {
-        "example_page",
-        "readme",
-        "tutorial_page",
-        "api_reference",
-    }
-
     official_count = sum(
         1
         for card in evidence_cards
@@ -84,8 +228,12 @@ def judge_evidence_quality(
     implementation_count = sum(
         1
         for card in evidence_cards
-        if card.get("page_kind", "") in implementation_page_kinds
+        if _has_implementation_evidence([card])
     )
+    has_implementation_evidence = implementation_count > 0
+    has_comparison_evidence = _has_comparison_evidence(evidence_cards)
+    needs_implementation_detail = _question_needs_implementation_detail(question)
+    needs_comparison = _question_needs_comparison(question)
     fallback_count = sum(
         1
         for card in evidence_cards
@@ -113,6 +261,12 @@ def judge_evidence_quality(
     if implementation_count < 1:
         evidence_gaps.append("example_source_missing")
 
+    if needs_implementation_detail and not has_implementation_evidence:
+        evidence_gaps.append("implementation_detail_missing")
+
+    if needs_comparison and not has_comparison_evidence:
+        evidence_gaps.append("comparison_missing")
+
     if (
         len(evidence_cards) >= 3
         and fallback_ratio >= FALLBACK_EVIDENCE_RATIO_THRESHOLD
@@ -129,6 +283,10 @@ def judge_evidence_quality(
             "official_count": official_count,
             "domain_count": len(unique_domains),
             "implementation_count": implementation_count,
+            "has_implementation_evidence": has_implementation_evidence,
+            "has_comparison_evidence": has_comparison_evidence,
+            "needs_implementation_detail": needs_implementation_detail,
+            "needs_comparison": needs_comparison,
             "fallback_count": fallback_count,
             "fallback_ratio": fallback_ratio,
             "retry_count": retry_count,

@@ -37,6 +37,8 @@ from services.evidence_synthesizer import (
     fallback_notes_from_evidence,
 )
 from services.llm import LLMService
+from services.page_summarizer import summarize_page_content
+from services.query_rewriter import build_rewritten_queries
 from services.report_builder import build_report_prompt, ensure_referenced_sources_are_listed
 from services.report_validator import validate_report_citations
 from services.search_ranker import (
@@ -158,64 +160,6 @@ def _contains_english_letters(text: str) -> bool:
     - 中英混合 query 可能会同时被中文统计与英文统计命中
     """
     return any(("a" <= ch.lower() <= "z") for ch in text)
-
-
-def _summarize_page_content(
-    question: str,
-    query: str,
-    title: str,
-    url: str,
-    page_content: str,
-) -> str:
-    """
-    对页面正文生成简要研究摘要。
-
-    设计目标：
-    1. 将页面正文压缩为更适合 evidence card 构建的摘要
-    2. 保持摘要与当前研究问题和子 query 相关
-    3. 控制摘要长度，避免后续节点处理过于发散
-
-    回退策略：
-    - 若 page_content 为空，则返回空字符串
-    - 若模型调用异常或返回空值，则回退到正文前若干字符
-    """
-    page_content = (page_content or "").strip()
-    if not page_content:
-        return ""
-
-    prompt = f"""
-研究主问题：
-{question}
-
-当前子问题：
-{query}
-
-页面标题：
-{title}
-
-页面链接：
-{url}
-
-页面正文：
-{page_content}
-
-请基于页面正文，生成 3~5 句简明研究摘要。
-要求：
-1. 只保留与研究问题相关的信息
-2. 尽量提取定义、关键机制、区别、实现要点、限制条件等内容
-3. 不要输出项目符号
-4. 不要编造页面中不存在的信息
-""".strip()
-
-    try:
-        summary = llm.chat(SYNTHESIZER_SYSTEM_PROMPT, prompt).strip()
-        if summary:
-            return summary
-    except Exception:
-        pass
-
-    # 模型摘要失败时，回退到正文前若干字符
-    return page_content[:500].strip()
 
 
 def plan_node(state: ResearchState) -> Dict[str, Any]:
@@ -417,12 +361,13 @@ def read_pages_node(state: ResearchState) -> Dict[str, Any]:
         if not page_content:
             page_content = snippet.strip()
 
-        page_summary = _summarize_page_content(
+        page_summary = summarize_page_content(
             question=question,
             query=query,
             title=title,
             url=url,
             page_content=page_content,
+            llm_service=llm,
         )
 
         page_item = {
@@ -511,6 +456,7 @@ def judge_search_quality_node(state: ResearchState) -> Dict[str, Any]:
     quality_result = judge_evidence_quality(
         evidence_cards=evidence_cards,
         retry_count=retry_count,
+        question=state.get("question", ""),
     )
     needs_retry = quality_result["needs_retry"]
     evidence_gaps = quality_result["evidence_gaps"]
@@ -522,6 +468,7 @@ def judge_search_quality_node(state: ResearchState) -> Dict[str, Any]:
         f"official_count={metrics['official_count']} | "
         f"domains={metrics['domain_count']} | "
         f"implementation_count={metrics['implementation_count']} | "
+        f"comparison_evidence={metrics['has_comparison_evidence']} | "
         f"retry_count={metrics['retry_count']} | "
         f"needs_retry={needs_retry}"
     )
@@ -539,52 +486,19 @@ def rewrite_query_node(state: ResearchState) -> Dict[str, Any]:
     """
     rewrite_query 节点：在当前证据不足时生成一轮补搜 query。
 
-    当前阶段采用基于 evidence_gaps 的规则改写：
-    - official_source_missing: 补官方文档 / 官方参考资料 query
-    - example_source_missing: 补 GitHub example / tutorial query
-    - insufficient_evidence: 补更宽的 docs / guide / reference query
-    - source_diversity_low: 补不同来源形态的 docs / examples query
-
-    后续将逐步扩展为：
-    1. 将 evidence_gaps 与子问题覆盖情况结合
-    2. 根据具体 topic 类型定制补搜模板
-    3. 使用模型进行更智能的 query rewrite
+    当前阶段采用 services/query_rewriter.py 中的 gap-specific 规则改写。
     """
     question = state.get("question", "")
     original_queries = state.get("search_queries", [])
     retry_count = state.get("retry_count", 0)
     evidence_gaps = state.get("evidence_gaps", [])
 
-    base_queries = original_queries or [question]
-    primary_query = base_queries[0] if base_queries else question
-
-    rewritten_queries: List[str] = []
-
-    if "official_source_missing" in evidence_gaps:
-        rewritten_queries.append(f"{primary_query} official documentation reference")
-
-    if "example_source_missing" in evidence_gaps:
-        rewritten_queries.append(f"{primary_query} GitHub example tutorial")
-
-    if "insufficient_evidence" in evidence_gaps:
-        rewritten_queries.append(f"{primary_query} docs guide implementation")
-
-    if "source_diversity_low" in evidence_gaps:
-        rewritten_queries.append(f"{primary_query} comparison examples best practices")
-
-    if "fallback_evidence_too_many" in evidence_gaps:
-        rewritten_queries.append(f"{primary_query} official docs guide reference")
-
-    # 若 judge 未给出明确缺口，保留一个稳定兜底策略。
-    if not rewritten_queries:
-        rewritten_queries = [
-            f"{query} official documentation"
-            for query in base_queries[:2]
-        ]
-
-    # 保序去重，避免生成重复补搜 query
-    rewritten_queries = _deduplicate_strings(rewritten_queries)
-    rewritten_queries = rewritten_queries[:MAX_SEARCH_QUERIES]
+    rewritten_queries = build_rewritten_queries(
+        question=question,
+        original_queries=original_queries,
+        evidence_gaps=evidence_gaps,
+        max_queries=MAX_SEARCH_QUERIES,
+    )
 
     new_retry_count = retry_count + 1
 
